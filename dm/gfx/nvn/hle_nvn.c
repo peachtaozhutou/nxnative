@@ -1208,20 +1208,42 @@ static _Atomic int g_user_cap;   // 0 = not set yet (DM_FPS_CAP / the 帧率 men
 static int g_cap_itv;   // 0 = follow the game; 1/2 = clamp the present interval (the 帧率 menu)
 static int g_hz = 60, g_display_mode = 0;   // present tick + interval mode (set by DM_FPS_CAP / present_cfg / the menu)
 static win_t *g_cap_win;   // the game's live window (the frame-cap switch writes its interval)
+// The remembered cap (the 帧率 menu writes DM_FPS_PREF; the launcher points it at a small file so
+// the pick survives a relaunch — the boot path below applies it before any game code runs).
+static int cap_pref_read(void) {
+    const char *p = getenv("DM_FPS_PREF");
+    if (!p) return 0;
+    FILE *f = fopen(p, "r"); if (!f) return 0;
+    char buf[16] = ""; fgets(buf, sizeof buf, f); fclose(f);
+    int c = atoi(buf);
+    return (c == 30 || c == 60) ? c : 0;
+}
+static void cap_pref_write(int c) {
+    const char *p = getenv("DM_FPS_PREF");
+    if (!p) return;
+    FILE *f = fopen(p, "w"); if (!f) { LOG("[RED] frame cap: cannot remember the pick in %s", p); return; }
+    fprintf(f, "%d\n", c); fclose(f);
+}
 __attribute__((constructor)) static void dm_cap_init(void) {
     const char *e = getenv("DM_FPS_CAP");
-    if (e) { int c = atoi(e); if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = c == 60 ? 1 : 2; } }
+    int c = e ? atoi(e) : 0;
+    if (c != 30 && c != 60) c = cap_pref_read();   // DM_FPS_CAP wins; otherwise the remembered pick
+    if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = c == 60 ? 1 : 2; }
 }
-// SV 3.0.1 main (build 709bfd66…): the Fl4sh9174 static 60FPS sites that change the game's timing
-// (the profile's patches.py, minus the vsync count — the interval clamp owns pacing — and the EMU
-// site already removed). The 帧率 menu flips them live: 60 = the community patch (dt pinned to
-// 1/60, so the loop unlocked to 60 runs at normal speed); 30 = the shipped code, which measures dt
-// itself and runs its native correct speed at the clamp's interval 2. Each write is one aligned
-// instruction word (atomic on arm64), so a game thread crossing the flip runs at worst one frame
-// on a half-built constant.
+// SV 3.0.1 main (build 709bfd66…): all eight timing sites of the Fl4sh9174 static 60FPS patch
+// (the profile's patches.py minus the EMU site already removed). The 帧率 menu flips them live:
+// 60 = the community patch (the frame asks for 1 vsync and dt is pinned, so the loop unlocked to
+// 60 runs at normal speed); 30 = the shipped code. The first user test flipped only the dt/scalar
+// sites and 30 still ran at half speed — the engine steps per frame, and the vsync count it asks
+// for each frame (0x2b7a874, pinned to 1 by the patch) is what its step is measured against, so
+// at 30 the vsync site must go back to the original `add w1,w20,#1` too. Full shipped bytes at the
+// clamp's interval 2 (= the game's own request) is hardware-equivalent by construction.
+// Each write is one aligned instruction word (atomic on arm64), so a game thread crossing the flip
+// runs at worst one frame on a half-built constant.
 #define SV_MAIN_BUILD "709bfd66115298640155fcc4979dba15"
 static const struct { uint32_t off, orig, patch; } k_fps_sites[] = {
-    { 0x0b92780, 0xf9400000, 0xd2940ac1 },   // ldr x0,[x0] → mov x1,#0xa056         (fixed dt pair 1)
+    { 0x2b7a874, 0x11000681, 0x52800021 },   // add w1,w20,#1 → mov w1,#1            (vsyncs per frame: the engine's step unit)
+    { 0x0b92780, 0xf9400000, 0xd2940ac1 },   // ldr x0,[x0] → mov x1,#0xa056         (fixed dt pair 1: 0x01fca056 = 1/30 s in ns)
     { 0x0b92784, 0xf9400501, 0xf2a03f81 },   // ldr x1,[x8,#8] → movk x1,#0x1fc,lsl #16
     { 0x02b7c540, 0x1a893100, 0x52800000 },  // csel w0,w8,w9,lo → mov w0,#0         (frame-count heuristic forced to 0)
     { 0x170c408, 0x52a7f00a, 0x52a84e0a },   // mov w10,#1.0f → mov w10,#60.0f       (per-frame scale, three slots)
@@ -1290,6 +1312,7 @@ void dm_fps_cap_set(int c) {
     atomic_store(&g_user_cap, c);
     g_cap_itv = c == 60 ? 1 : 2;      // clamp the game's interval writes: cap 60 -> 1, cap 30 -> 2
     if (g_cap_win) g_cap_win->interval = g_cap_itv;   // and the live window, right now
+    cap_pref_write(c);                // remember the pick: the next launch boots straight into it
     LOG("[nvn] frame cap set to %d (interval clamped to %d)", c, c == 60 ? 1 : 2);
 }
 int dm_fps_cap_get(void) { return atomic_load(&g_user_cap); }
@@ -1308,7 +1331,13 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
-NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (g_cap_itv && v != g_cap_itv) v = g_cap_itv; if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
+NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
+    static int last_raw;   // the game's own request, before the clamp: at cap 30 it must be 2 (the vanilla path), at 60 it is 1
+    if (v != last_raw) { LOG("[nvn] the game requests present interval %d%s", v, g_cap_itv && v != g_cap_itv ? " (clamped)" : ""); last_raw = v; }
+    if (g_cap_itv && v != g_cap_itv) v = g_cap_itv;
+    if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v);
+    ((win_t *)w)->interval = v;
+}
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
