@@ -228,6 +228,67 @@ static NSString *cap_name(int c) { return c == 30 ? @"30 (原版)" : c == 60 ? @
         [[NSApp mainMenu] performSelector:@selector(submenuWithTitle:) withObject:@"帧率" afterDelay:0]; }   // checkmarks refresh on next open
 }
 @end
+// The 帧率 OSD, in the style of the by3 library's compact HUD (games/pv third_party/d2r_gfx fps_overlay.c +
+// frontend.m): one small dark rounded box in the window's top-right corner, the measured line in green
+// monospaced (yellow while frames are being dropped below the cap) and the cap in small grey below, refreshed
+// twice a second. A subview of the game's content view (not a floating panel): it moves with the window and
+// never takes a click.
+@interface DmHudBox : NSView
+@property(strong) NSTextField *label;
+@property NSSize textSize;
+-(void)refresh;
+@end
+@implementation DmHudBox
+-(instancetype)initWithFrame:(NSRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.wantsLayer = YES;
+        self.layer.backgroundColor = [NSColor colorWithCalibratedWhite:0.04 alpha:0.72].CGColor;
+        self.layer.cornerRadius = 7;
+        self.layer.borderWidth = 1;
+        self.layer.borderColor = [NSColor colorWithCalibratedWhite:1 alpha:0.14].CGColor;
+        self.label = [NSTextField labelWithString:@"…"];
+        self.label.autoresizingMask = NSViewNotSizable;
+        [self addSubview:self.label];
+    }
+    return self;
+}
+-(NSView *)hitTest:(NSPoint)p { (void)p; return nil; }   // the game gets every click
+-(void)viewDidMoveToSuperview { [super viewDidMoveToSuperview]; [self position]; }
+-(void)layout { [super layout]; [self position]; }
+-(void)position {
+    if (!self.superview) return;
+    NSRect b = self.superview.bounds;
+    NSRect f = NSMakeRect(floor(b.size.width - self.textSize.width - 20), floor(b.size.height - self.textSize.height - 15),
+                          self.textSize.width + 20, self.textSize.height + 10);
+    if (!NSEqualRects(self.frame, f)) self.frame = f;
+    self.label.frame = NSMakeRect(10, 5, self.textSize.width, self.textSize.height);
+}
+-(void)refresh {
+    extern void dm_hud_sample(int *fps, int *w, int *h);
+    extern int dm_fps_cap_get(void);
+    int fps = 0, w = 0, h = 0; dm_hud_sample(&fps, &w, &h);
+    self.hidden = fps <= 0;   // nothing measured yet (first call): stay out of the way
+    if (fps > 0) g_win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, fps, w, h];
+    int cap = dm_fps_cap_get();
+    if (!cap) { const char *e = getenv("DM_FPS_CAP"); cap = e ? atoi(e) : 0; }   // no menu pick / env yet
+    NSFont *mono = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium], *small = [NSFont systemFontOfSize:10];
+    NSColor *green = [NSColor colorWithCalibratedRed:80 / 255.0 green:1 blue:120 / 255.0 alpha:1],
+            *yellow = [NSColor colorWithCalibratedRed:1 green:230 / 255.0 blue:40 / 255.0 alpha:1],
+            *grey = [NSColor colorWithCalibratedWhite:0.75 alpha:1];
+    NSMutableAttributedString *a = [NSMutableAttributedString new];
+    if (fps > 0) [a appendAttributedString:[[NSAttributedString alloc]
+        initWithString:[NSString stringWithFormat:@"FPS %d  %d×%d\n", fps, w, h]
+        attributes:@{NSFontAttributeName: mono, NSForegroundColorAttributeName: cap && fps < cap - 2 ? yellow : green}]];
+    if (cap) [a appendAttributedString:[[NSAttributedString alloc]
+        initWithString:[NSString stringWithFormat:@"帧率上限 %@", cap_name(cap)]
+        attributes:@{NSFontAttributeName: small, NSForegroundColorAttributeName: grey}]];
+    if ([a isEqualToAttributedString:self.label.attributedStringValue]) return;
+    self.label.attributedStringValue = a;
+    NSSize z = [self.label sizeThatFits:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
+    self.textSize = NSMakeSize(ceil(z.width), ceil(z.height));
+    [self position];
+}
+@end
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -260,37 +321,15 @@ void front_run(void (*guest)(void)) {
         g_screen_fps = (int)(win.screen ?: NSScreen.mainScreen).maximumFramesPerSecond;
         g_win = win;
         [NSApp activateIgnoringOtherApps:YES];
-        // Title-bar HUD (once a second): presents per second and the game's swapchain size.
-        // DM_HUD=0 turns it off. (Frame cap: the 帧率 menu below / DM_FPS_CAP, see hle_nvn.c.)
+        // Title bar + the corner OSD (DmHudBox above), refreshed twice a second.
+        // DM_HUD=0 turns the OSD off. (Frame cap: the 帧率 menu below / DM_FPS_CAP, see hle_nvn.c.)
         extern void dm_fps_cap_set(int); extern int dm_fps_cap_get(void);
-        __block int g_cap = -1;
-        // OSD: borderless non-activating panel over the game, top-left. DM_HUD=0 turns it off.
-        __block NSPanel *osd = nil; __block CATextLayer *osd_text = nil;
+        { int c = dm_fps_cap_get(); if (!c) { const char *e = getenv("DM_FPS_CAP"); c = e ? atoi(e) : 30; } [DmCapHelper shared].cap = c; }   // the menu's checkmarks start on the boot cap
         if (!getenv("DM_HUD") || atoi(getenv("DM_HUD"))) {
-            extern void dm_hud_sample(int *fps, int *w, int *h);
-            osd = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 460, 64)
-              styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
-            osd.level = NSFloatingWindowLevel; osd.opaque = NO; osd.backgroundColor = [NSColor clearColor];
-            osd.ignoresMouseEvents = YES; osd.hasShadow = NO; osd.worksWhenModal = YES;
-            CATextLayer *tl = osd_text = [CATextLayer layer];
-            tl.frame = osd.contentLayoutRect; tl.contentsScale = 3; tl.fontSize = 20;
-            tl.foregroundColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.95].CGColor;
-            tl.backgroundColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.45].CGColor;
-            tl.string = @"…"; tl.frame = NSMakeRect(0, 0, 460, 64);
-            NSView *cv = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 460, 64)];
-            cv.wantsLayer = YES; cv.layer = tl; osd.contentView = cv;   // contentView must be an NSView; the text goes on its layer
-            NSTimer *hud = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *) {
-                int fps = 0, w = 0, h = 0; dm_hud_sample(&fps, &w, &h);
-                int cap = g_cap; if (cap < 0) { const char *e = getenv("DM_FPS_CAP"); cap = e ? atoi(e) : 30; g_cap = cap; [DmCapHelper shared].cap = cap; }
-                if (fps > 0) {
-                    tl.string = [NSString stringWithFormat:@"%d fps · %d×%d · 上限 %@", fps, w, h, cap_name(cap)];
-                    win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, fps, w, h];
-                    NSRect wf = win.frame;
-                    NSPoint op = NSMakePoint(wf.origin.x + 24, wf.origin.y + wf.size.height - 110);
-                    if (!osd.isVisible) { [osd setFrameOrigin:op]; [osd orderFrontRegardless]; }
-                    else if (!NSEqualPoints(osd.frame.origin, op)) [osd setFrameOrigin:op];
-                }
-            }];
+            DmHudBox *osd = [[DmHudBox alloc] initWithFrame:NSMakeRect(0, 0, 220, 50)];
+            [win.contentView addSubview:osd];
+            [osd refresh];
+            NSTimer *hud = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer *t) { (void)t; [osd refresh]; }];
             [[NSRunLoop mainRunLoop] addTimer:hud forMode:NSRunLoopCommonModes];
         }
         // Main menu: AppKit runs ⌘ shortcuts only through menu items, so ⌘Q quits and ⌃⌘F toggles fullscreen from here (AppKit shows the item as Globe-F and keeps ⌃⌘F as a hidden twin)

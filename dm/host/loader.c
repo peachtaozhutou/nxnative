@@ -21,6 +21,9 @@ enum { KEY_K18, KEY_KTLS, KEY_KTLR, KEY_KGATE, KEY_N };
 uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
+// hle_nvn.c (strong definition): applies the boot DM_FPS_CAP to main's timing patch sites before
+// the game runs. Weak here: the graphics unit tests link the loader without hle_nvn.c.
+__attribute__((weak)) void dm_fps_sites_boot_apply(void);
 
 static pthread_key_t key_value(unsigned i) {
     switch (i) {
@@ -578,6 +581,7 @@ void load_modules(const char *dir, const char **names, int n) {
     force_init();
     t = now_ns(); for (int i = 0; i < g_nmod; i++) relocate(&g_mod[i]); tr = now_ns() - t;
     force_check();
+    if (dm_fps_sites_boot_apply) dm_fps_sites_boot_apply();   // the boot frame cap, before any game code runs
     preload_nros(dir);   // mapped now, relocated when the game loads them (hle_ro.c)
     { void hlecount_seal(void); hlecount_seal(); }   // DM_HLECOUNT: relocation done, seal the counting stub pages as read-only executable
     if (getenv("DM_SYMCHECK")) LOG("DM_SYMCHECK: %lu symbol lookups at load time, hash and linear disagree %lu", g_symchk_n, g_symchk_bad);

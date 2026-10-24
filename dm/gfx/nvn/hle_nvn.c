@@ -18,6 +18,7 @@
 #include "../../host/front.h"
 #include "nvn_dirty.h"
 #include <mach/mach_time.h>
+#include <libkern/OSCacheControl.h>   // sys_icache_invalidate (the frame-cap timing-site flip)
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
@@ -1211,8 +1212,81 @@ __attribute__((constructor)) static void dm_cap_init(void) {
     const char *e = getenv("DM_FPS_CAP");
     if (e) { int c = atoi(e); if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = c == 60 ? 1 : 2; } }
 }
+// SV 3.0.1 main (build 709bfd66…): the Fl4sh9174 static 60FPS sites that change the game's timing
+// (the profile's patches.py, minus the vsync count — the interval clamp owns pacing — and the EMU
+// site already removed). The 帧率 menu flips them live: 60 = the community patch (dt pinned to
+// 1/60, so the loop unlocked to 60 runs at normal speed); 30 = the shipped code, which measures dt
+// itself and runs its native correct speed at the clamp's interval 2. Each write is one aligned
+// instruction word (atomic on arm64), so a game thread crossing the flip runs at worst one frame
+// on a half-built constant.
+#define SV_MAIN_BUILD "709bfd66115298640155fcc4979dba15"
+static const struct { uint32_t off, orig, patch; } k_fps_sites[] = {
+    { 0x0b92780, 0xf9400000, 0xd2940ac1 },   // ldr x0,[x0] → mov x1,#0xa056         (fixed dt pair 1)
+    { 0x0b92784, 0xf9400501, 0xf2a03f81 },   // ldr x1,[x8,#8] → movk x1,#0x1fc,lsl #16
+    { 0x02b7c540, 0x1a893100, 0x52800000 },  // csel w0,w8,w9,lo → mov w0,#0         (frame-count heuristic forced to 0)
+    { 0x170c408, 0x52a7f00a, 0x52a84e0a },   // mov w10,#1.0f → mov w10,#60.0f       (per-frame scale, three slots)
+    { 0x20a8d3c, 0x72a8e868, 0x72a8f868 },   // movk w8,#0x4743 → #0x47c3            (50 000.0f → 100 000.0f)
+    { 0x0d9643c, 0xf8747908, 0xd2940ac8 },   // ldr x8,[x8,x20,lsl #3] → mov x8,#0xa056  (fixed dt pair 2)
+    { 0x0d96440, 0xd1000508, 0xf2a03f88 },   // sub x8,x8,#1 → movk x8,#0x1fc,lsl #16
+};
+// Write the wanted word into main's text at every site. Text is mapped R+X (loader.c map_image);
+// the flip borrows the loader's own mprotect dance (RW for the write, back to R+X, i-cache
+// invalidate). A site whose current word is neither orig nor patch means the image is not the
+// patched build this table was made from — skip it loudly, never write blind.
+// Returns the sites now in the wanted state, or -1 when main / its build id is not there (yet).
+typedef struct { volatile uint32_t *at; uint32_t w; } fps_site_job;
+static int fps_sites_apply(int mode60) {
+    module_t *mm = NULL;
+    for (int i = 0; i < g_nmod; i++)
+        if (!strcmp(g_mod[i].name, "main") && !strcmp(g_mod[i].build_id, SV_MAIN_BUILD)) mm = &g_mod[i];
+    if (!mm) return -1;
+    fps_site_job jobs[sizeof k_fps_sites / sizeof *k_fps_sites];
+    int nj = 0, ok = 0;
+    for (unsigned k = 0; k < sizeof k_fps_sites / sizeof *k_fps_sites; k++) {
+        volatile uint32_t *at = (volatile uint32_t *)(mm->base + k_fps_sites[k].off);
+        uint32_t want = mode60 ? k_fps_sites[k].patch : k_fps_sites[k].orig;
+        uint32_t cur = *at;
+        if (cur == want) { ok++; continue; }
+        uint32_t was = mode60 ? k_fps_sites[k].orig : k_fps_sites[k].patch;
+        if (cur != was || k_fps_sites[k].off >= mm->text_end) {
+            LOG("[RED] frame cap: main+%#x holds %#010x, expected the %s word %#010x; site skipped",
+                k_fps_sites[k].off, cur, mode60 ? "original" : "60fps-patched", was);
+            continue;
+        }
+        jobs[nj].at = at; jobs[nj].w = want; nj++;
+    }
+    for (int i = 1; i < nj; i++) {   // by address, so each mprotect covers a contiguous page run
+        fps_site_job t = jobs[i]; int j = i - 1;
+        while (j >= 0 && jobs[j].at > t.at) { jobs[j + 1] = jobs[j]; j--; }
+        jobs[j + 1] = t;
+    }
+    for (int i = 0; i < nj; ) {
+        uint64_t pg = (uint64_t)jobs[i].at & ~0x3fffull;   // 16K pages (arm64 macOS)
+        int j = i; while (j < nj && ((uint64_t)jobs[j].at & ~0x3fffull) == pg) j++;
+        if (mprotect((void *)pg, 0x4000, PROT_READ | PROT_WRITE)) {
+            LOG("[RED] frame cap: main+%#llx mprotect RW failed (%s), sites skipped", (unsigned long long)(pg - (uint64_t)mm->base), strerror(errno));
+        } else {
+            for (int k = i; k < j; k++) *jobs[k].at = jobs[k].w;
+            sys_icache_invalidate((void *)jobs[i].at, (size_t)((uint8_t *)jobs[j - 1].at - (uint8_t *)jobs[i].at) + 4);
+            if (mprotect((void *)pg, 0x4000, PROT_READ | PROT_EXEC))
+                LOG("[RED] frame cap: main+%#llx back to R+X failed (%s) — page left writable", (unsigned long long)(pg - (uint64_t)mm->base), strerror(errno));
+        }
+        i = j;
+    }
+    if (nj) LOG("[nvn] frame cap: %s timing sites written into main (%d words over %d already there)", mode60 ? "60fps" : "original 30fps", nj, ok);
+    return ok + nj;
+}
+// The boot cap (DM_FPS_CAP, read by the constructor above) applies before any game code runs: the
+// loader calls this at the end of load_modules, ahead of DT_INIT / nnMain.
+void dm_fps_sites_boot_apply(void) {
+    int c = atomic_load(&g_user_cap);
+    if (!c) return;   // no cap requested: the image ships with the 60fps patch, leave it
+    int r = fps_sites_apply(c == 60);
+    LOG("[nvn] frame cap %d at boot: timing sites %s", c, r < 0 ? "not applied (main build not loaded)" : "in place before the game runs");
+}
 void dm_fps_cap_set(int c) {
     if (c != 30 && c != 60) return;   // SV's engine paces per frame: faster caps run it fast
+    fps_sites_apply(c == 60);         // the timing words first: a frame in the gap runs at its normal speed, not a half one
     atomic_store(&g_user_cap, c);
     g_cap_itv = c == 60 ? 1 : 2;      // clamp the game's interval writes: cap 60 -> 1, cap 30 -> 2
     if (g_cap_win) g_cap_win->interval = g_cap_itv;   // and the live window, right now
