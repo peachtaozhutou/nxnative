@@ -300,7 +300,7 @@ void front_run(void (*guest)(void)) {
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
         NSMenu *fpsm = [[NSMenu alloc] initWithTitle:@"帧率"];
-        for (NSNumber *c in @[@30, @60, @120, @0]) {
+        for (NSNumber *c in @[@30, @60]) {
             NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:cap_name(c.intValue) action:@selector(dm_cap_pick:) keyEquivalent:@""];
             it.tag = c.intValue; it.target = [DmCapHelper shared]; [fpsm addItem:it];
         }

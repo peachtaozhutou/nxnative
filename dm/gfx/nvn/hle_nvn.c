@@ -1204,19 +1204,15 @@ NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *c
 }
 NVN(nvnWindowBuilderSetPresentInterval, void, NVNwindowBuilder *b, int v) { WB(b)->interval = v; }
 static _Atomic int g_user_cap;   // 0 = not set yet (DM_FPS_CAP / the 帧率 menu)
-static int g_force_itv1;
+static int g_cap_itv;   // 0 = follow the game; 1/2 = clamp the present interval (the 帧率 menu)
 static int g_hz = 60, g_display_mode = 0;   // present tick + interval mode (set by DM_FPS_CAP / present_cfg / the menu)
-/* moved up */ static _Atomic int g_user_cap;   // 0 = not set yet (DM_FPS_CAP / default 30 semantics)
-static int g_force_itv1;
+static win_t *g_cap_win;   // the game's live window (the frame-cap switch writes its interval)
 void dm_fps_cap_set(int c) {
-    if (c != 30 && c != 60 && c != 120 && c != 0) return;
+    if (c != 30 && c != 60) return;   // SV's engine paces per frame: faster caps run it fast
     atomic_store(&g_user_cap, c);
-    g_force_itv1 = c != 30;
-    if (c == 30) { g_hz = 60; g_display_mode = 0; }   // the present tick stays 60; the game's own interval 2 gives 30
-    else if (c == 60) { g_hz = 60; g_display_mode = 0; }
-    else if (c == 120) { g_hz = 120; g_display_mode = 0; { extern void mtl_set_present_link(int); mtl_set_present_link(2); } }
-    else { g_hz = 0; g_display_mode = 0; }
-    LOG("[nvn] frame cap set to %d (present %d Hz, interval %s)", c, g_hz, g_force_itv1 ? "forced 1" : "game's own");
+    g_cap_itv = c == 60 ? 1 : 2;      // clamp the game's interval writes: cap 60 -> 1, cap 30 -> 2
+    if (g_cap_win) g_cap_win->interval = g_cap_itv;   // and the live window, right now
+    LOG("[nvn] frame cap set to %d (interval clamped to %d)", c, c == 60 ? 1 : 2);
 }
 int dm_fps_cap_get(void) { return atomic_load(&g_user_cap); }
 
@@ -1227,13 +1223,14 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
     memcpy(o->tex, s->tex, sizeof o->tex);
     for (int i = 0; i < o->ntex; i++) if (o->tex[i]) mtl_xv_window_tex(CTX(o->tex[i])->serial);
     g_swap_w = o->ntex ? (int)CTX(o->tex[0])->d.width : 0; g_swap_h = o->ntex ? (int)CTX(o->tex[0])->d.height : 0;
-    if (g_force_itv1 && o->interval > 1) { o->interval = 1; LOG("[nvn] frame cap: swapchain interval forced to 1"); }
+    g_cap_win = o;
+    if (g_cap_itv && o->interval != g_cap_itv) { o->interval = g_cap_itv; LOG("[nvn] frame cap: swapchain interval set to %d", g_cap_itv); }
     LOG("[nvn] WindowInitialize swap chain %d textures, interval %d, first %dx%d format %#x", o->ntex, o->interval,
         g_swap_w, g_swap_h, o->ntex ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
-NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (g_force_itv1 && v > 1) v = 1; if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
+NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (g_cap_itv && v != g_cap_itv) v = g_cap_itv; if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
@@ -1560,7 +1557,7 @@ static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided y
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
 int nvn_game_fps(void) { int c = fps_step_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() - s >= 1000000000ull ? 30 : 60; }
 static void present_cfg(const win_t *o) {
-    if (g_hz != 60 || g_display_mode != 0) return;   // the cap/menu already configured pacing
+    if (atomic_load(&g_user_cap)) return;   // the cap/menu already configured pacing
     // The interval mode comes from the game profile (present_interval, default game): whether frames follow the present interval the game sets depends on whether the game's logic counts frames, which differs per game. Environment variables override it, and can override the fixed 60 Hz.
     int scr = mtl_display_hz();
     const char *e = getenv("DM_PRESENT_HZ"); g_hz = e ? atoi(e) : 60;
