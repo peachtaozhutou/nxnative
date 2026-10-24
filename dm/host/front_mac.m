@@ -9,6 +9,7 @@
 #import <QuartzCore/CAMetalLayer.h>
 #import <Metal/Metal.h>
 #import <GameController/GameController.h>
+#import <QuartzCore/QuartzCore.h>
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -213,6 +214,20 @@ static void *guest_tramp(void *p) {
 
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) setenv("MTL_HUD_ENABLED", "1", 0); }
+static NSString *cap_name(int c) { return c == 30 ? @"30 (原版)" : c == 60 ? @"60" : c == 120 ? @"120" : @"不限制"; }
+@interface DmCapHelper : NSObject
++ (instancetype)shared;
+- (void)dm_cap_pick:(NSMenuItem *)s;
+@property int cap;
+@end
+@implementation DmCapHelper
++ (instancetype)shared { static DmCapHelper *h; return h ?: (h = [DmCapHelper new]); }
+- (instancetype)init { if ((self = [super init])) _cap = 30; return self; }
+- (void)dm_cap_pick:(NSMenuItem *)s {
+    if (s.tag >= 0) { self.cap = s.tag; extern void dm_fps_cap_set(int); dm_fps_cap_set(self.cap);
+        [[NSApp mainMenu] performSelector:@selector(submenuWithTitle:) withObject:@"帧率" afterDelay:0]; }   // checkmarks refresh on next open
+}
+@end
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -246,12 +261,35 @@ void front_run(void (*guest)(void)) {
         g_win = win;
         [NSApp activateIgnoringOtherApps:YES];
         // Title-bar HUD (once a second): presents per second and the game's swapchain size.
-        // DM_HUD=0 turns it off. (Frame cap: DM_FPS_CAP=30|60|120|0, see hle_nvn.c present_cfg.)
+        // DM_HUD=0 turns it off. (Frame cap: the 帧率 menu below / DM_FPS_CAP, see hle_nvn.c.)
+        extern void dm_fps_cap_set(int); extern int dm_fps_cap_get(void);
+        __block int g_cap = -1;
+        // OSD: borderless non-activating panel over the game, top-left. DM_HUD=0 turns it off.
+        __block NSPanel *osd = nil; __block CATextLayer *osd_text = nil;
         if (!getenv("DM_HUD") || atoi(getenv("DM_HUD"))) {
             extern void dm_hud_sample(int *fps, int *w, int *h);
+            osd = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 460, 64)
+              styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO];
+            osd.level = NSFloatingWindowLevel; osd.opaque = NO; osd.backgroundColor = [NSColor clearColor];
+            osd.ignoresMouseEvents = YES; osd.hasShadow = NO; osd.worksWhenModal = YES;
+            CATextLayer *tl = osd_text = [CATextLayer layer];
+            tl.frame = osd.contentLayoutRect; tl.contentsScale = 3; tl.fontSize = 20;
+            tl.foregroundColor = [NSColor colorWithCalibratedWhite:1.0 alpha:0.95].CGColor;
+            tl.backgroundColor = [NSColor colorWithCalibratedWhite:0.0 alpha:0.45].CGColor;
+            tl.string = @"…"; tl.frame = NSMakeRect(0, 0, 460, 64);
+            NSView *cv = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 460, 64)];
+            cv.wantsLayer = YES; cv.layer = tl; osd.contentView = cv;   // contentView must be an NSView; the text goes on its layer
             NSTimer *hud = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *) {
                 int fps = 0, w = 0, h = 0; dm_hud_sample(&fps, &w, &h);
-                if (fps > 0) win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, fps, w, h];
+                int cap = g_cap; if (cap < 0) { const char *e = getenv("DM_FPS_CAP"); cap = e ? atoi(e) : 30; g_cap = cap; [DmCapHelper shared].cap = cap; }
+                if (fps > 0) {
+                    tl.string = [NSString stringWithFormat:@"%d fps · %d×%d · 上限 %@", fps, w, h, cap_name(cap)];
+                    win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, fps, w, h];
+                    NSRect wf = win.frame;
+                    NSPoint op = NSMakePoint(wf.origin.x + 24, wf.origin.y + wf.size.height - 110);
+                    if (!osd.isVisible) { [osd setFrameOrigin:op]; [osd orderFrontRegardless]; }
+                    else if (!NSEqualPoints(osd.frame.origin, op)) [osd setFrameOrigin:op];
+                }
             }];
             [[NSRunLoop mainRunLoop] addTimer:hud forMode:NSRunLoopCommonModes];
         }
@@ -261,6 +299,13 @@ void front_run(void (*guest)(void)) {
         [app addItemWithTitle:@"Quit " DM_GAME_NAME action:@selector(terminate:) keyEquivalent:@"q"];
         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+        NSMenu *fpsm = [[NSMenu alloc] initWithTitle:@"帧率"];
+        for (NSNumber *c in @[@30, @60, @120, @0]) {
+            NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:cap_name(c.intValue) action:@selector(dm_cap_pick:) keyEquivalent:@""];
+            it.tag = c.intValue; it.target = [DmCapHelper shared]; [fpsm addItem:it];
+        }
+        NSMenuItem *fpsroot = [[NSMenuItem alloc] initWithTitle:@"帧率上限" action:nil keyEquivalent:@""];
+        [fpsroot setSubmenu:fpsm]; [bar addItem:fpsroot];
         NSApp.mainMenu = bar;
         if (getenv("DM_FULLSCREEN")) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });   // start in fullscreen
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
