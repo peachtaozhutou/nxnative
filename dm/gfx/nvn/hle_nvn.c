@@ -1207,6 +1207,10 @@ static _Atomic int g_user_cap;   // 0 = not set yet (DM_FPS_CAP / the 帧率 men
 static int g_cap_itv;   // 0 = follow the game; 1/2 = clamp the present interval (the 帧率 menu)
 static int g_hz = 60, g_display_mode = 0;   // present tick + interval mode (set by DM_FPS_CAP / present_cfg / the menu)
 static win_t *g_cap_win;   // the game's live window (the frame-cap switch writes its interval)
+__attribute__((constructor)) static void dm_cap_init(void) {
+    const char *e = getenv("DM_FPS_CAP");
+    if (e) { int c = atoi(e); if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = c == 60 ? 1 : 2; } }
+}
 void dm_fps_cap_set(int c) {
     if (c != 30 && c != 60) return;   // SV's engine paces per frame: faster caps run it fast
     atomic_store(&g_user_cap, c);
@@ -1566,8 +1570,7 @@ static void present_cfg(const win_t *o) {
     // smoothing — the game still renders at its own rate; true 60 needs SV's frame-step site);
     // 120 additionally runs the 120 Hz display link; 0 uncaps for profiling (the game's
     // frame-counting UI logic may drift — see the warning above).
-    const char *cap = getenv("DM_FPS_CAP");
-    if (cap) { extern void dm_fps_cap_set(int); dm_fps_cap_set(atoi(cap)); }
+
     if (!g_hz) LOG("[nvn] [WARNING] DM_PRESENT_HZ=0: frame rate uncapped, frame pacing unlike the device, UI logic may drift (for profiling only, not for verdicts / cross-checks)");
     // Cut (intentional deviation from the original game's behavior): with DM_PRESENT_INTERVAL=display the present interval set by the game is not followed and one frame is presented per display-link tick,
     // with a fixed hard floor of 60 fps; the logic stays at 25 ticks, and the client's frame-counted UI logic is unaffected -
