@@ -1,8 +1,11 @@
 # Pokemon Violet (01008F6008C5E000) v3.0.1: 60fps enablement (Fl4sh9174's static 60FPS v4.0.0
 # pchtxt, all 9 sites verbatim). Build-ID key is the NSO build id, first 32 hex.
-# These bytes are what the shipped image carries (the 60fps set). The 帧率 menu's 30档 flips the
-# seven timing sites back to their original words at runtime (hle_nvn.c k_fps_sites / fps_sites_apply):
-# the shipped code measures dt itself and runs its native correct speed at the clamp's interval 2.
+# These bytes are what the shipped image carries and what BOTH 帧率上限 modes run: the game loop is
+# paced at 60 (interval clamp 1) in both, and the 30 档 holds every frame for two refreshes on the
+# display link (nvn_mtl.m) — 60 fps simulation, 30 fps on screen. Restoring the shipped words at 30
+# (two user-tested rounds, down to all eight timing sites) still walked at half speed: the engine's
+# per-frame step count (main+0xcd27bc, [slot+0x180]) cannot be fixed from the timing sites. The site
+# table lives in hle_nvn.c k_fps_sites as a load-time check of these bytes.
 CUTS = {
   '709bfd66115298640155fcc4979dba15': [
     (0x2b7a874, '81060011', '21008052', 'vsyncs-per-frame: add w1,w20,#1 -> mov w1,#1'),

@@ -1228,18 +1228,19 @@ __attribute__((constructor)) static void dm_cap_init(void) {
     const char *e = getenv("DM_FPS_CAP");
     int c = e ? atoi(e) : 0;
     if (c != 30 && c != 60) c = cap_pref_read();   // DM_FPS_CAP wins; otherwise the remembered pick
-    if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = c == 60 ? 1 : 2; }
+    if (c == 30 || c == 60) { atomic_store(&g_user_cap, c); g_cap_itv = 1; }   // both caps pace the loop at 60 (see k_fps_sites)
 }
-// SV 3.0.1 main (build 709bfd66…): all eight timing sites of the Fl4sh9174 static 60FPS patch
-// (the profile's patches.py minus the EMU site already removed). The 帧率 menu flips them live:
-// 60 = the community patch (the frame asks for 1 vsync and dt is pinned, so the loop unlocked to
-// 60 runs at normal speed); 30 = the shipped code. The first user test flipped only the dt/scalar
-// sites and 30 still ran at half speed — the engine steps per frame, and the vsync count it asks
-// for each frame (0x2b7a874, pinned to 1 by the patch) is what its step is measured against, so
-// at 30 the vsync site must go back to the original `add w1,w20,#1` too. Full shipped bytes at the
-// clamp's interval 2 (= the game's own request) is hardware-equivalent by construction.
-// Each write is one aligned instruction word (atomic on arm64), so a game thread crossing the flip
-// runs at worst one frame on a half-built constant.
+// SV 3.0.1 main (build 709bfd66…): the eight timing sites of the Fl4sh9174 static 60FPS patch (the
+// profile's patches.py minus the EMU site already removed). Both cap modes run the game's loop with
+// these 60fps words. Two user tests restored the seven dt/scalar sites — and then all eight, down to
+// the shipped bytes — at cap 30 and the walk was still half speed: the engine's per-frame step count
+// (main+0xcd27bc passes [slot+0x180] into "advance the simulation by N steps", and Fl4sh's dynamic
+// patch computes exactly that N from the measured frame time) cannot be corrected from the timing
+// sites alone. So cap 30 keeps the proven 60 Hz loop (dt pinned to 1/30 s as two half-steps — months
+// of user gameplay at correct speed) and nvn_mtl.m's display link holds every frame for two refreshes:
+// 60 fps simulation, 30 fps on screen.
+// The table stays as a load-time check of the patched image: any site not holding its patch word is
+// written back (or reported if the word is unknown) — never blindly.
 #define SV_MAIN_BUILD "709bfd66115298640155fcc4979dba15"
 static const struct { uint32_t off, orig, patch; } k_fps_sites[] = {
     { 0x2b7a874, 0x11000681, 0x52800021 },   // add w1,w20,#1 → mov w1,#1            (vsyncs per frame: the engine's step unit)
@@ -1251,13 +1252,13 @@ static const struct { uint32_t off, orig, patch; } k_fps_sites[] = {
     { 0x0d9643c, 0xf8747908, 0xd2940ac8 },   // ldr x8,[x8,x20,lsl #3] → mov x8,#0xa056  (fixed dt pair 2)
     { 0x0d96440, 0xd1000508, 0xf2a03f88 },   // sub x8,x8,#1 → movk x8,#0x1fc,lsl #16
 };
-// Write the wanted word into main's text at every site. Text is mapped R+X (loader.c map_image);
-// the flip borrows the loader's own mprotect dance (RW for the write, back to R+X, i-cache
+// Ensure the 60fps word is in main's text at every site. Text is mapped R+X (loader.c map_image);
+// the fix borrows the loader's own mprotect dance (RW for the write, back to R+X, i-cache
 // invalidate). A site whose current word is neither orig nor patch means the image is not the
 // patched build this table was made from — skip it loudly, never write blind.
-// Returns the sites now in the wanted state, or -1 when main / its build id is not there (yet).
+// Returns the sites now in the patch state, or -1 when main / its build id is not there (yet).
 typedef struct { volatile uint32_t *at; uint32_t w; } fps_site_job;
-static int fps_sites_apply(int mode60) {
+static int fps_sites_ensure60(void) {
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++)
         if (!strcmp(g_mod[i].name, "main") && !strcmp(g_mod[i].build_id, SV_MAIN_BUILD)) mm = &g_mod[i];
@@ -1266,16 +1267,14 @@ static int fps_sites_apply(int mode60) {
     int nj = 0, ok = 0;
     for (unsigned k = 0; k < sizeof k_fps_sites / sizeof *k_fps_sites; k++) {
         volatile uint32_t *at = (volatile uint32_t *)(mm->base + k_fps_sites[k].off);
-        uint32_t want = mode60 ? k_fps_sites[k].patch : k_fps_sites[k].orig;
         uint32_t cur = *at;
-        if (cur == want) { ok++; continue; }
-        uint32_t was = mode60 ? k_fps_sites[k].orig : k_fps_sites[k].patch;
-        if (cur != was || k_fps_sites[k].off >= mm->text_end) {
-            LOG("[RED] frame cap: main+%#x holds %#010x, expected the %s word %#010x; site skipped",
-                k_fps_sites[k].off, cur, mode60 ? "original" : "60fps-patched", was);
+        if (cur == k_fps_sites[k].patch) { ok++; continue; }
+        if ((cur != k_fps_sites[k].orig && cur != k_fps_sites[k].patch) || k_fps_sites[k].off >= mm->text_end) {
+            LOG("[RED] frame cap: main+%#x holds %#010x, expected %#010x (patch) or %#010x (shipped); site skipped",
+                k_fps_sites[k].off, cur, k_fps_sites[k].patch, k_fps_sites[k].orig);
             continue;
         }
-        jobs[nj].at = at; jobs[nj].w = want; nj++;
+        jobs[nj].at = at; jobs[nj].w = k_fps_sites[k].patch; nj++;
     }
     for (int i = 1; i < nj; i++) {   // by address, so each mprotect covers a contiguous page run
         fps_site_job t = jobs[i]; int j = i - 1;
@@ -1295,25 +1294,25 @@ static int fps_sites_apply(int mode60) {
         }
         i = j;
     }
-    if (nj) LOG("[nvn] frame cap: %s timing sites written into main (%d words over %d already there)", mode60 ? "60fps" : "original 30fps", nj, ok);
+    if (nj) LOG("[nvn] frame cap: 60fps timing sites written into main (%d words over %d already there)", nj, ok);
     return ok + nj;
 }
-// The boot cap (DM_FPS_CAP, read by the constructor above) applies before any game code runs: the
+// The boot cap (DM_FPS_CAP, read by the constructor above) is verified before any game code runs: the
 // loader calls this at the end of load_modules, ahead of DT_INIT / nnMain.
 void dm_fps_sites_boot_apply(void) {
     int c = atomic_load(&g_user_cap);
-    if (!c) return;   // no cap requested: the image ships with the 60fps patch, leave it
-    int r = fps_sites_apply(c == 60);
-    LOG("[nvn] frame cap %d at boot: timing sites %s", c, r < 0 ? "not applied (main build not loaded)" : "in place before the game runs");
+    if (!c) return;   // no cap requested: leave the image as shipped
+    int r = fps_sites_ensure60();
+    LOG("[nvn] frame cap %d at boot: 60fps timing sites %s", c, r < 0 ? "not checked (main build not loaded)" : "verified in place before the game runs");
 }
 void dm_fps_cap_set(int c) {
     if (c != 30 && c != 60) return;   // SV's engine paces per frame: faster caps run it fast
-    fps_sites_apply(c == 60);         // the timing words first: a frame in the gap runs at its normal speed, not a half one
+    fps_sites_ensure60();             // both caps run the 60fps words (k_fps_sites above); a no-op once verified
     atomic_store(&g_user_cap, c);
-    g_cap_itv = c == 60 ? 1 : 2;      // clamp the game's interval writes: cap 60 -> 1, cap 30 -> 2
-    if (g_cap_win) g_cap_win->interval = g_cap_itv;   // and the live window, right now
+    g_cap_itv = 1;                    // both caps pace the loop at 60; cap 30 holds frames on screen instead (nvn_mtl.m link hold)
+    if (g_cap_win && g_cap_win->interval != g_cap_itv) g_cap_win->interval = g_cap_itv;   // the live window, right now
     cap_pref_write(c);                // remember the pick: the next launch boots straight into it
-    LOG("[nvn] frame cap set to %d (interval clamped to %d)", c, c == 60 ? 1 : 2);
+    LOG("[nvn] frame cap set to %d (loop paced at 60%s)", c, c == 30 ? "; the display holds each frame for 2 refreshes" : "");
 }
 int dm_fps_cap_get(void) { return atomic_load(&g_user_cap); }
 
@@ -1332,7 +1331,7 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
 }
 NVN(nvnWindowGetPresentInterval, int, const NVNwindow *w) { return ((const win_t *)w)->interval; }   // Link's Awakening reads it back every frame
 NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
-    static int last_raw;   // the game's own request, before the clamp: at cap 30 it must be 2 (the vanilla path), at 60 it is 1
+    static int last_raw;   // the game's own request, before the clamp: with the 60fps patch it is 1 (both caps clamp to 1)
     if (v != last_raw) { LOG("[nvn] the game requests present interval %d%s", v, g_cap_itv && v != g_cap_itv ? " (clamped)" : ""); last_raw = v; }
     if (g_cap_itv && v != g_cap_itv) v = g_cap_itv;
     if (((win_t *)w)->interval != v) LOG("[nvn] the game sets present interval %d → %d", ((win_t *)w)->interval, v);
@@ -1374,17 +1373,22 @@ uint64_t dm_nvn_frame_count(void) { return g_frame; }
 //   assumes; SV sets interval 2 at boot, which paces its loop to 30 through WindowAcquireTexture);
 //   120 = interval 1 + the 120 Hz display link; 0 = uncapped (interval 1, no pacing).
 //   g_force_itv1 clamps WindowInitialize / WindowSetPresentInterval to 1 while it is on.
-// HUD sample for the front end's title bar: presents in the last second (fps) and the swapchain size.
-// Counter-based: g_frame advances per frame the game submits; the front end diffs it once a second.
-void dm_hud_sample(int *fps, int *w, int *h) {
-    static uint64_t last_frame; static uint64_t last_ns; static int last_fps;
+// HUD sample for the front end: the game's present rate (g_frame), the frames actually shown
+// (nvn_mtl.m's shown counter — at cap 30 the display holds every second frame, so this is 30 while
+// the game presents 60), and the swapchain size. Counter-based, diffed between calls.
+__attribute__((weak)) uint64_t mtl_shown_n(void) { return 0; }   // nvn_mtl.m provides the strong definition; graphics unit tests may not link it
+void dm_hud_sample(int *fps, int *w, int *h, int *dfps) {
+    static uint64_t last_frame, last_shown; static uint64_t last_ns; static int last_fps, last_dfps;
     uint64_t now = now_ns();
+    uint64_t shown = mtl_shown_n();
     if (last_ns && now > last_ns) {
         double dt = (double)(now - last_ns) / 1e9;
         last_fps = (int)((double)(g_frame - last_frame) / dt + 0.5);
+        last_dfps = (int)((double)(shown - last_shown) / dt + 0.5);
     }
-    last_frame = g_frame; last_ns = now;
+    last_frame = g_frame; last_shown = shown; last_ns = now;
     if (fps) *fps = last_fps;
+    if (dfps) *dfps = last_dfps;
     if (w) *w = g_swap_w;
     if (h) *h = g_swap_h;
 }

@@ -8085,6 +8085,8 @@ static pres_ent g_pres[PRING];
 double mtl_presented_time(uint64_t n) { pres_ent e = g_pres[n % PRING]; return e.n == n ? e.t : 0; }
 static _Atomic uint64_t g_drawable_ns;   // Accumulated wall clock waiting for nextDrawable in present (timing instrumentation)
 uint64_t mtl_drawable_ns_take(void) { return atomic_exchange(&g_drawable_ns, 0); }
+static _Atomic uint64_t g_shown_n;   // frames actually put on screen (present_now success); the HUD's frame rate counts these
+uint64_t mtl_shown_n(void) { return atomic_load(&g_shown_n); }
 // Maximum refresh rate (Hz) of the screen when there is a window; returns 0 without a window. Mac uses CoreGraphics display modes (thread-safe C interface; the present configuration is read on the game thread)
 int mtl_display_hz(void) {
     if (!front_metal_layer()) return 0;
@@ -8324,6 +8326,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     if (target_ts > 0) [dr present];
     else if (period > 0) [dr presentAfterMinimumDuration:period]; else [dr present];
 #endif
+    atomic_fetch_add(&g_shown_n, 1);   // frames actually put on screen (the HUD's frame rate counts these, not the game's presents)
     (void)frame;
     return 1;
 }
@@ -8395,7 +8398,14 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     int submitted;
     ext_wait(it.ev_val);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
-    g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
+    // SV's 帧率上限 30 (dm_fps_cap_get, hle_nvn.c): the game simulates at 60 with the community patch's pinned
+    // dt (the only path whose speed is provably correct — see k_fps_sites there), so the display holds every
+    // frame for two refreshes: present one update, skip the ones inside the next 2 periods. The doubling only
+    // applies when the game itself runs interval 1 (period ≤ 21 ms): a game pacing its own 30 (period 33 ms)
+    // keeps the plain one-period hold.
+    double disp = it.period;
+    if (it.period > 0 && it.period <= 0.021) { extern int dm_fps_cap_get(void); if (dm_fps_cap_get() == 30) disp *= 2; }
+    g_link_hold_until = submitted && disp > 0.025 ? update.targetPresentationTimestamp + disp : 0;
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;

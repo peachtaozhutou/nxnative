@@ -214,7 +214,7 @@ static void *guest_tramp(void *p) {
 
 // Metal reads MTL_HUD_ENABLED when the process makes its first device, which can be before the window: set from DM_METAL_HUD before main (set in front_run, the HUD did not show)
 __attribute__((constructor)) static void hud_env(void) { if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) setenv("MTL_HUD_ENABLED", "1", 0); }
-static NSString *cap_name(int c) { return c == 30 ? @"30 (原版)" : c == 60 ? @"60" : c == 120 ? @"120" : @"不限制"; }
+static NSString *cap_name(int c) { return c == 30 ? @"30 (稳定档)" : c == 60 ? @"60" : c == 120 ? @"120" : @"不限制"; }
 @interface DmCapHelper : NSObject
 + (instancetype)shared;
 - (void)dm_cap_pick:(NSMenuItem *)s;
@@ -264,11 +264,12 @@ static NSString *cap_name(int c) { return c == 30 ? @"30 (原版)" : c == 60 ? @
     self.label.frame = NSMakeRect(10, 5, self.textSize.width, self.textSize.height);
 }
 -(void)refresh {
-    extern void dm_hud_sample(int *fps, int *w, int *h);
+    extern void dm_hud_sample(int *fps, int *w, int *h, int *dfps);
     extern int dm_fps_cap_get(void);
-    int fps = 0, w = 0, h = 0; dm_hud_sample(&fps, &w, &h);
-    self.hidden = fps <= 0;   // nothing measured yet (first call): stay out of the way
-    if (fps > 0) g_win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, fps, w, h];
+    int fps = 0, w = 0, h = 0, dfps = 0; dm_hud_sample(&fps, &w, &h, &dfps);
+    if (dfps <= 0) dfps = fps;   // no shown counter yet (first call): fall back to the present rate
+    self.hidden = dfps <= 0;   // nothing measured yet: stay out of the way
+    if (dfps > 0) g_win.title = [NSString stringWithFormat:@"%@ — %d fps · %d×%d", @DM_GAME_NAME, dfps, w, h];
     int cap = dm_fps_cap_get();
     if (!cap) { const char *e = getenv("DM_FPS_CAP"); cap = e ? atoi(e) : 0; }   // no menu pick / env yet
     NSFont *mono = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightMedium], *small = [NSFont systemFontOfSize:10];
@@ -276,9 +277,9 @@ static NSString *cap_name(int c) { return c == 30 ? @"30 (原版)" : c == 60 ? @
             *yellow = [NSColor colorWithCalibratedRed:1 green:230 / 255.0 blue:40 / 255.0 alpha:1],
             *grey = [NSColor colorWithCalibratedWhite:0.75 alpha:1];
     NSMutableAttributedString *a = [NSMutableAttributedString new];
-    if (fps > 0) [a appendAttributedString:[[NSAttributedString alloc]
-        initWithString:[NSString stringWithFormat:@"FPS %d  %d×%d\n", fps, w, h]
-        attributes:@{NSFontAttributeName: mono, NSForegroundColorAttributeName: cap && fps < cap - 2 ? yellow : green}]];
+    if (dfps > 0) [a appendAttributedString:[[NSAttributedString alloc]
+        initWithString:[NSString stringWithFormat:@"FPS %d  %d×%d\n", dfps, w, h]
+        attributes:@{NSFontAttributeName: mono, NSForegroundColorAttributeName: cap && dfps < cap - 2 ? yellow : green}]];
     if (cap) [a appendAttributedString:[[NSAttributedString alloc]
         initWithString:[NSString stringWithFormat:@"帧率上限 %@", cap_name(cap)]
         attributes:@{NSFontAttributeName: small, NSForegroundColorAttributeName: grey}]];
