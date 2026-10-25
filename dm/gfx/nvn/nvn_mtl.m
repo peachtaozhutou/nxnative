@@ -1942,6 +1942,17 @@ static id<MTLTexture> tex_linear(const tex_t *t) {
     id<MTLBuffer> b = (__bridge id<MTLBuffer>)mb;
     NSUInteger al = [g_dev minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)pf];
     if (mo % al || row % al) { RED_ONCE(65, "linear texture offset %#llx / row pitch %zu not aligned to %lu bytes; created as a private texture (CPU writes invisible)", (unsigned long long)mo, row, (unsigned long)al); return nil; }
+    {   // the buffer-backed texture must fit the buffer: Metal does not bounds-check newTextureWithDescriptor:offset:,
+        // and a texture that runs past the buffer's end page-faults the GPU on its first sample (SV's opening cutscene: the
+        // 2048x2048 R8 glyph atlas right after the load-time texture burst)
+        NSUInteger bl = b.length, need = row * (size_t)(t->d.height ? t->d.height : 1);
+        if (mo + need > bl) {
+            RED_ONCE(66, "buffer-backed linear texture overruns its pool buffer: offset %llu + %zu B (%ux%u format %#x ser %llu) > buffer %llu B — bound as an empty slot (read 0, no glyphs)",
+                     (unsigned long long)mo, need, t->d.width, t->d.height, t->d.format, (unsigned long long)t->serial, (unsigned long long)bl);
+            return nil;
+        }
+        static int first; if (first++ < 2) MLOG("buffer-backed linear texture ser=%llu %ux%ux%u: offset %llu of buffer %llu B, need %zu B — fits", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, (unsigned long long)mo, (unsigned long long)bl, need);
+    }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:(MTLPixelFormat)pf width:t->d.width ? t->d.width : 1 height:t->d.height ? t->d.height : 1 mipmapped:NO];
     d.resourceOptions = b.resourceOptions;
     d.usage = MTLTextureUsageShaderRead | (t->d.flags & NVN_TEXTURE_FLAGS_IMAGE ? MTLTextureUsageShaderWrite : 0) | (t->d.flags & NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET ? MTLTextureUsageRenderTarget : 0);
