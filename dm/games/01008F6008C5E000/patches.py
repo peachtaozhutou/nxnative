@@ -1,21 +1,20 @@
-# Pokemon Violet (01008F6008C5E000) v3.0.1: 60fps enablement (Fl4sh9174's static 60FPS v4.0.0
-# pchtxt, all 9 sites verbatim). Build-ID key is the NSO build id, first 32 hex.
-# These bytes are what the shipped image carries and what BOTH 帧率上限 modes run: the game loop is
-# paced at 60 (interval clamp 1) in both, and the 30 档 holds every frame for two refreshes on the
-# display link (nvn_mtl.m) — 60 fps simulation, 30 fps on screen. Restoring the shipped words at 30
-# (two user-tested rounds, down to all eight timing sites) still walked at half speed: the engine's
-# per-frame step count (main+0xcd27bc, [slot+0x180]) cannot be fixed from the timing sites. The site
-# table lives in hle_nvn.c k_fps_sites as a load-time check of these bytes.
+# Pokemon Violet (01008F6008C5E000) v3.0.1: the 60fps static set (Fl4sh9174, all 9 sites) PLUS the
+# imgui-callback NOP (0x1526d64) from the Dynamic FPS ASM mod: the vanilla imgui compute function
+# (registered at 0x1526d44-64, body at 0x1760ec8) faults the GPU (BIF0 page fault, read at VA 0x40)
+# on its first draw (the opening cutscene / gift menu); with the registration suppressed the imgui
+# compute goes through the alternative path, which ran fine on the Oct 24 evening build (0fe9589
+# carried this exact NOP). Build-ID key = the NSO build id, first 32 hex.
 CUTS = {
   '709bfd66115298640155fcc4979dba15': [
     (0x2b7a874, '81060011', '21008052', 'vsyncs-per-frame: add w1,w20,#1 -> mov w1,#1'),
-    (0xb92780, '000040f9', 'c10a94d2', 'fixed-dt constant: ldr x0,[x0] -> movz x1,#0xa056,lsl#16'),
-    (0xb92784, '010540f9', '813fa0f2', 'fixed-dt constant: ldr x1,[x8,#8] -> movk x1,#0x81fc,lsl#32'),
-    (0x2b7c540, '0031891a', '00008052', 'csel w0,w8,w9,lo -> mov w0,#0'),
-    (0x170c408, '0af0a752', '0a4ea852', 'time scalar 1.0f -> 0.5f-class constant'),
-    (0x20a8d3c, '68e8a872', '68f8a872', 'movk time scalar'),
-    (0x3c2fbb0, '56a0fc01', '2b50fe00', 'EMU frame-time site'),
-    (0xd9643c, '087974f8', 'c80a94d2', 'ldr x8,[x8,x20,lsl#3] -> movz x1,#0xa056,lsl#16'),
-    (0xd96440, '080500d1', '883fa0f2', 'sub x8,x8,#1 -> movk x1,#0x81fc,lsl#32'),
+    (0x00b92780, '000040f9', 'c10a94d2', 'fixed-dt: ldr x0,[x0] -> mov x1,#0xa056'),
+    (0x00b92784, '010540f9', '813fa0f2', 'fixed-dt: ldr x1,[x8,#8] -> movk x1,#0x1fc,lsl #16'),
+    (0x02b7c540, '0031891a', '00008052', 'csel w0,w8,w9,lo -> mov w0,#0'),
+    (0x0170c408, '0af0a752', '0a4ea852', 'time scalar 1.0f -> 60.0f'),
+    (0x020a8d3c, '68e8a872', '68f8a872', 'movk time scalar 50000 -> 100000'),
+    (0x03c2fbb0, '56a0fc01', '2b50fe00', 'EMU frame-time site'),
+    (0x00d9643c, '087974f8', 'c80a94d2', 'fixed-dt 2: ldr x8,[x8,x20,lsl#3] -> mov x8,#0xa056'),
+    (0x00d96440, '080500d1', '883fa0f2', 'fixed-dt 2: sub x8,x8,#1 -> movk x8,#0x1fc,lsl #16'),
+    (0x1526d64, 'e92f05a9', '1f2003d5', 'imgui callback registration NOP (the compute goes through the alternative path; the vanilla one faults the GPU)'),
   ],
 }
