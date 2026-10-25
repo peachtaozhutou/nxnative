@@ -93,6 +93,7 @@ static pthread_mutex_t g_link_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_link_tick_ns, g_link_tick_n;
 static uint64_t g_link_dropped;
 static double g_link_hold_until; static uint64_t g_link_held;   // Changed only on the display-link callback thread: the time the previous frame must stay on screen until by its present interval (0 = no hold), and the ticks that took no new frame because of it
+static _Atomic int g_cap30_phase;   // SV's cap-30 display cadence: alternates present / process-only on the link ticks (display-link callback thread only)
 static int g_pq_inflight;   // Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
 int g_dm_present_link;   // Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
 static int g_present_latency = 1;
@@ -8383,6 +8384,14 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     // The previous frame's present interval was >= 2 (period > 25 ms): keep it on screen for its whole period before taking the next one, as the Switch flips only every N vertical syncs. This also holds while the link runs at 60 Hz (Mario 1.2.1 sets 2 for single frames, see nvn_game_fps in hle_nvn.c);
     //   before, every tick took the newest frame, so that frame, carrying the extra time step the game advanced for it, was shown for only 16.7 ms and the game looked like it jumped ahead
     if (g_link_hold_until > 0 && update.targetPresentationTimestamp < g_link_hold_until - tol) { g_link_held++; pthread_mutex_unlock(&g_pq_mu); return; }
+    // SV's 帧率上限 30 (dm_fps_cap_get, hle_nvn.c): the game simulates at 60 with the community patch's pinned
+    // dt (the only path whose speed is provably correct — see k_fps_sites there), and the display shows every
+    // second frame: a present every 33.3 ms stays up two refreshes on its own. EVERY frame is still taken and
+    // processed each tick — the first hold-based attempt throttled the whole present thread to 30 Hz and the
+    // swapchain textures came back at 30 Hz too, dragging the game's 60 Hz loop down with them (half speed).
+    // The skipped frame is recorded as processed-but-not-displayed, which releases its texture right away.
+    int skip = 0;
+    { extern int dm_fps_cap_get(void); if (dm_fps_cap_get() == 30) skip = atomic_fetch_add(&g_cap30_phase, 1) & 1; }   // alternate: present, process-only, present, ...
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     // In order, one frame per tick and at most one behind the newest: two waiting, the older now and the newer on the next tick; three or more, the older ones are dropped. Taking the newest
     // dropped the one before whenever two frames landed in the same refresh, as frames of a 60 fps game that take 16-17.5 ms do, and the next frame then stayed up 33 ms
@@ -8393,19 +8402,20 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     g_pq_read = ticket;
     if (ticket > first) { g_link_dropped += ticket - first; for (uint64_t k = first; k < ticket; k++) g_pres[k % PRING] = (pres_ent){k, -1}; }   // Old frames merged and dropped are recorded as "not presented", so the present statistics honestly count them as dropped frames
     if (ticket > 1 && g_pq_done < ticket - 1) g_pq_done = ticket - 1;
+    if (skip) {   // processed, not displayed: the texture returns to the game's swapchain at once
+        g_pres[ticket % PRING] = (pres_ent){ticket, -1};
+        if (ticket > g_pq_done) g_pq_done = ticket;
+        g_link_held++;
+        pthread_cond_broadcast(&g_pq_cv);
+        pthread_mutex_unlock(&g_pq_mu);
+        return;
+    }
     pthread_cond_broadcast(&g_pq_cv);
     pthread_mutex_unlock(&g_pq_mu);
     int submitted;
     ext_wait(it.ev_val);
     @autoreleasepool { submitted = present_now(&it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
-    // SV's 帧率上限 30 (dm_fps_cap_get, hle_nvn.c): the game simulates at 60 with the community patch's pinned
-    // dt (the only path whose speed is provably correct — see k_fps_sites there), so the display holds every
-    // frame for two refreshes: present one update, skip the ones inside the next 2 periods. The doubling only
-    // applies when the game itself runs interval 1 (period ≤ 21 ms): a game pacing its own 30 (period 33 ms)
-    // keeps the plain one-period hold.
-    double disp = it.period;
-    if (it.period > 0 && it.period <= 0.021) { extern int dm_fps_cap_get(void); if (dm_fps_cap_get() == 30) disp *= 2; }
-    g_link_hold_until = submitted && disp > 0.025 ? update.targetPresentationTimestamp + disp : 0;
+    g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
     if (!submitted) {
         pthread_mutex_lock(&g_pq_mu);
         if (ticket > g_pq_done) g_pq_done = ticket;
