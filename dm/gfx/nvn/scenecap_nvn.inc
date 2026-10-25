@@ -335,9 +335,15 @@ static int sc_host_texture_info(void *user, uint64_t serial, scenecap_texture_in
     return 1;
 }
 
-/* The Metal texture for the readback blit; resolved only at the frame boundary, never while recording. */
+/* The Metal texture for the readback blit; resolved only at the frame boundary, never while recording.
+ * tex_get is the host's pure serial -> object lookup (the same path "texraw" uses): tex_mtl here would
+ * materialise / re-upload from whatever thread the flush runs on, and upload batches are submit-thread
+ * only - the owner check aborts the process mid-flush. */
 static id<MTLTexture> sc_tex_mtl(sc_tex_ent *e) {
-    return e ? tex_mtl(&e->meta) : nil;
+    if (!e) return nil;
+    __unsafe_unretained id o = tex_get(e->serial);
+    if (!o || ![o conformsToProtocol:@protocol(MTLTexture)]) return nil;
+    return o;
 }
 
 static size_t sc_pixel_bytes(MTLPixelFormat pf) {
