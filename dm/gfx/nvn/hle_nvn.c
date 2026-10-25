@@ -1258,7 +1258,11 @@ static const struct { uint32_t off, orig, patch; } k_fps_sites[] = {
 // patched build this table was made from — skip it loudly, never write blind.
 // Returns the sites now in the patch state, or -1 when main / its build id is not there (yet).
 typedef struct { volatile uint32_t *at; uint32_t w; } fps_site_job;
-static int fps_sites_ensure60(void) {
+// DM_PV_NO_PATCH=1: run the shipped timing words everywhere (both caps) — the opening cutscene
+// faults the GPU under the 60fps patch on every cap/pacing/DLC combination, while the user's
+// original save was created on a pre-patch build and passed.
+static int pv_no_patch(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PV_NO_PATCH"); v = e && atoi(e); } return v; }
+static int fps_sites_apply(int mode60) {
     module_t *mm = NULL;
     for (int i = 0; i < g_nmod; i++)
         if (!strcmp(g_mod[i].name, "main") && !strcmp(g_mod[i].build_id, SV_MAIN_BUILD)) mm = &g_mod[i];
@@ -1267,14 +1271,16 @@ static int fps_sites_ensure60(void) {
     int nj = 0, ok = 0;
     for (unsigned k = 0; k < sizeof k_fps_sites / sizeof *k_fps_sites; k++) {
         volatile uint32_t *at = (volatile uint32_t *)(mm->base + k_fps_sites[k].off);
+        uint32_t want = mode60 ? k_fps_sites[k].patch : k_fps_sites[k].orig;
         uint32_t cur = *at;
-        if (cur == k_fps_sites[k].patch) { ok++; continue; }
-        if ((cur != k_fps_sites[k].orig && cur != k_fps_sites[k].patch) || k_fps_sites[k].off >= mm->text_end) {
-            LOG("[RED] frame cap: main+%#x holds %#010x, expected %#010x (patch) or %#010x (shipped); site skipped",
-                k_fps_sites[k].off, cur, k_fps_sites[k].patch, k_fps_sites[k].orig);
+        if (cur == want) { ok++; continue; }
+        uint32_t other = mode60 ? k_fps_sites[k].orig : k_fps_sites[k].patch;
+        if ((cur != other && cur != want) || k_fps_sites[k].off >= mm->text_end) {
+            LOG("[RED] frame cap: main+%#x holds %#010x, expected %#010x or %#010x; site skipped",
+                k_fps_sites[k].off, cur, want, other);
             continue;
         }
-        jobs[nj].at = at; jobs[nj].w = k_fps_sites[k].patch; nj++;
+        jobs[nj].at = at; jobs[nj].w = want; nj++;
     }
     for (int i = 1; i < nj; i++) {   // by address, so each mprotect covers a contiguous page run
         fps_site_job t = jobs[i]; int j = i - 1;
@@ -1294,20 +1300,25 @@ static int fps_sites_ensure60(void) {
         }
         i = j;
     }
-    if (nj) LOG("[nvn] frame cap: 60fps timing sites written into main (%d words over %d already there)", nj, ok);
+    if (nj) LOG("[nvn] frame cap: %s timing sites written into main (%d words over %d already there)", mode60 ? "60fps" : "shipped", nj, ok);
     return ok + nj;
 }
 // The boot cap (DM_FPS_CAP, read by the constructor above) is verified before any game code runs: the
 // loader calls this at the end of load_modules, ahead of DT_INIT / nnMain.
 void dm_fps_sites_boot_apply(void) {
+    if (pv_no_patch()) {   // DM_PV_NO_PATCH: the shipped words, cap or no cap
+        int r0 = fps_sites_apply(0);
+        LOG("[nvn] DM_PV_NO_PATCH: shipped timing words written before the game runs (%s)", r0 < 0 ? "main not loaded" : "done");
+        return;
+    }
     int c = atomic_load(&g_user_cap);
     if (!c) return;   // no cap requested: leave the image as shipped
-    int r = fps_sites_ensure60();
-    LOG("[nvn] frame cap %d at boot: 60fps timing sites %s", c, r < 0 ? "not checked (main build not loaded)" : "verified in place before the game runs");
+    int r = fps_sites_apply(1);
+    LOG("[nvn] frame cap %d at boot: %s timing sites %s", c, pv_no_patch() ? "shipped" : "60fps", r < 0 ? "not checked (main build not loaded)" : "verified in place before the game runs");
 }
 void dm_fps_cap_set(int c) {
     if (c != 30 && c != 60) return;   // SV's engine paces per frame: faster caps run it fast
-    fps_sites_ensure60();             // both caps run the 60fps words (k_fps_sites above); a no-op once verified
+    fps_sites_apply(!pv_no_patch());  // both caps run the same words (k_fps_sites above); a no-op once verified
     atomic_store(&g_user_cap, c);
     g_cap_itv = 1;                    // both caps pace the loop at 60; cap 30 holds frames on screen instead (nvn_mtl.m link hold)
     if (g_cap_win && g_cap_win->interval != g_cap_itv) g_cap_win->interval = g_cap_itv;   // the live window, right now
