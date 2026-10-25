@@ -145,6 +145,14 @@ static void *ctl_main(void *arg) {
                 if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1); } continue; }
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
+#if SCENECAP_HOOKS
+                if (!strncmp(line, "scenecap ", 9)) {   // scenecap <path> [frames]: a scene package from the next frame boundary
+                    void dm_gfx_scenecap_next(const char *path); void dm_gfx_scenecap_record(const char *path, unsigned frames);
+                    char *sp = strchr(line + 9, ' '); unsigned frames = sp ? (unsigned)strtoul(sp + 1, NULL, 0) : 1; if (sp) *sp = 0;
+                    if (frames > 1) { dm_gfx_scenecap_record(line + 9, frames); LOG("DM_CTL: scenecap recording %u frames from the next frame → %s", frames, line + 9); }
+                    else { dm_gfx_scenecap_next(line + 9); LOG("DM_CTL: scenecap capture of the next frame → %s", line + 9); }
+                    continue; }
+#endif
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
                     float x0, y0, x1, y1, s = 0.3f; if (sscanf(line + 5, "%f %f %f %f %f", &x0, &y0, &x1, &y1, &s) < 4) { LOG("[RED] DM_CTL drag wants x0 y0 x1 y1 [seconds]"); continue; }
                     int n = (int)(s / 0.008f); if (n < 2) n = 2;

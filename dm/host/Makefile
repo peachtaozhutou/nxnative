@@ -14,7 +14,7 @@ $(error no game profile $(GAME) (neither in dm/games nor in DM_GAMES_DIR))
 endif
 endif
 GAME_H = gen/$(GAME)/game_profile.h
-CFLAGS=-O1 -g -Wall -Wno-unused-function
+CFLAGS=-O1 -g -Wall -Wno-unused-function -DSCENECAP_HOOKS=$(if $(SCENECAP),$(SCENECAP),0)   # SCENECAP=1 builds the scene-capture hooks in (make GAME=... SCENECAP=1)
 # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
 SRC=main.c loader.c hle.c crash.c probe.c thread.c memstat.m haptics_apple.m $(sort $(wildcard hle_*.c)) front_mac.m entry.S
 # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
