@@ -415,10 +415,86 @@ struct scenecap_capture {
     /* Blob ids already written: one shader can serve several pipelines and must be stored only once. */
     char **blob_ids;
     size_t blob_id_count, blob_id_cap;
+
+    /* Ring capture: PV submits ~1700 draws a frame, so an unbounded multi-frame window makes the manifest
+     * JSON outgrow the container's 64 MiB manifest limit within seconds.  Records older than the newest
+     * keep_frames frames are evicted at each frame boundary; the package then always holds the last few
+     * frames - exactly the ones leading into a hang.  0 = keep everything (SCENECAP_KEEP_FRAMES). */
+    uint32_t keep_frames;
 };
 
 static void mark_usage(scenecap_capture *c, int32_t res, uint32_t bits) {
     if (res >= 0 && (size_t)res < c->res_count) c->res[res].usage |= bits;
+}
+
+/* Open-addressing hash over the interned resources.  A linear scan of the res array was O(res_count) per
+ * binding; PV draws ~1700 times a frame with dozens of bindings each, which made the res array the whole
+ * frame's CPU budget within seconds.  Textures key on (serial, level, layer), buffers on (address, size). */
+static uint64_t sc_mix64(uint64_t x) {
+    x ^= x >> 33;
+    x *= 0xff51afd7ed558ccdull;
+    x ^= x >> 33;
+    x *= 0xc4ceb9fe1a85ec53ull;
+    x ^= x >> 33;
+    return x;
+}
+
+typedef struct {
+    uint64_t k0, k1, k2;
+    int32_t idx; /* index into res + 1; 0 = empty slot */
+} sc_res_hent;
+
+static sc_res_hent *g_res_hash;
+static size_t g_res_hash_cap; /* power of two, or 0 until the first insert */
+static size_t g_res_hash_used;
+
+static uint64_t sc_res_key2(int is_texture, uint32_t level, uint32_t layer) {
+    return is_texture ? (0x1ull << 63) | (uint64_t)level | ((uint64_t)layer << 32) : 0;
+}
+
+static int32_t sc_res_hash_find(uint64_t k0, uint64_t k1, uint64_t k2) {
+    if (!g_res_hash_cap) return -1;
+    size_t mask = g_res_hash_cap - 1;
+    for (size_t s = (size_t)(sc_mix64(k0 ^ sc_mix64(k1) ^ sc_mix64(k2)) & mask);; s = (s + 1) & mask) {
+        if (!g_res_hash[s].idx) return -1;
+        if (g_res_hash[s].k0 == k0 && g_res_hash[s].k1 == k1 && g_res_hash[s].k2 == k2) return g_res_hash[s].idx - 1;
+    }
+}
+
+static void sc_res_hash_put(uint64_t k0, uint64_t k1, uint64_t k2, int32_t idx) {
+    if (g_res_hash_cap && (g_res_hash_used + 1) * 10 >= g_res_hash_cap * 7) {
+        size_t cap = g_res_hash_cap * 2;
+        sc_res_hent *next = calloc(cap, sizeof *next);
+        if (next) {
+            size_t mask = cap - 1;
+            for (size_t e = 0; e < g_res_hash_cap; e++) {
+                if (!g_res_hash[e].idx) continue;
+                for (size_t s = (size_t)(sc_mix64(g_res_hash[e].k0 ^ sc_mix64(g_res_hash[e].k1) ^ sc_mix64(g_res_hash[e].k2)) & mask);; s = (s + 1) & mask) {
+                    if (!next[s].idx) { next[s] = g_res_hash[e]; break; }
+                }
+            }
+            free(g_res_hash);
+            g_res_hash = next;
+            g_res_hash_cap = cap;
+        }
+    }
+    if (!g_res_hash_cap) {
+        g_res_hash = calloc(1024, sizeof *g_res_hash);
+        if (!g_res_hash) return; /* fall back to nothing: interning stays correct without the cache */
+        g_res_hash_cap = 1024;
+    }
+    size_t mask = g_res_hash_cap - 1;
+    for (size_t s = (size_t)(sc_mix64(k0 ^ sc_mix64(k1) ^ sc_mix64(k2)) & mask);; s = (s + 1) & mask) {
+        if (!g_res_hash[s].idx) {
+            g_res_hash[s].k0 = k0;
+            g_res_hash[s].k1 = k1;
+            g_res_hash[s].k2 = k2;
+            g_res_hash[s].idx = idx + 1;
+            g_res_hash_used++;
+            return;
+        }
+        if (g_res_hash[s].k0 == k0 && g_res_hash[s].k1 == k1 && g_res_hash[s].k2 == k2) return;
+    }
 }
 
 /* ---------------------------------------------------------------------------------------------------------- *
@@ -486,10 +562,9 @@ static int pass_push_pipe(pass_rec *pass, uint32_t index) {
  * ---------------------------------------------------------------------------------------------------------- */
 
 static int32_t intern_texture(scenecap_capture *c, uint64_t serial, uint32_t level, uint32_t layer) {
-    for (size_t i = 0; i < c->res_count; i++) {
-        res_rec *r = &c->res[i];
-        if (r->is_texture && r->serial == serial && r->level == level && r->layer == layer) return (int32_t)i;
-    }
+    uint64_t k2 = sc_res_key2(1, level, layer);
+    int32_t hit = sc_res_hash_find(serial, (uint64_t)level | ((uint64_t)layer << 32), k2);
+    if (hit >= 0 && (size_t)hit < c->res_count) return hit;
     if (!sc_grow((void **)&c->res, &c->res_cap, c->res_count, sizeof *c->res)) return -1;
     res_rec *r = &c->res[c->res_count];
     memset(r, 0, sizeof *r);
@@ -517,15 +592,14 @@ static int32_t intern_texture(scenecap_capture *c, uint64_t serial, uint32_t lev
         c->dropped_resources++;
     }
     c->res_count++;
+    sc_res_hash_put(serial, (uint64_t)level | ((uint64_t)layer << 32), k2, (int32_t)(c->res_count - 1));
     return (int32_t)(c->res_count - 1);
 }
 
 static int32_t intern_buffer(scenecap_capture *c, uint64_t address, uint64_t size) {
     if (size == 0) return -1;
-    for (size_t i = 0; i < c->res_count; i++) {
-        res_rec *r = &c->res[i];
-        if (!r->is_texture && r->address == address && r->size == size) return (int32_t)i;
-    }
+    int32_t hit = sc_res_hash_find(address, size, 0);
+    if (hit >= 0 && (size_t)hit < c->res_count && !c->res[hit].is_texture) return hit;
     if (!sc_grow((void **)&c->res, &c->res_cap, c->res_count, sizeof *c->res)) return -1;
     res_rec *r = &c->res[c->res_count];
     memset(r, 0, sizeof *r);
@@ -558,6 +632,7 @@ static int32_t intern_buffer(scenecap_capture *c, uint64_t address, uint64_t siz
         }
     }
     c->res_count++;
+    sc_res_hash_put(address, size, 0, (int32_t)(c->res_count - 1));
     return (int32_t)(c->res_count - 1);
 }
 
@@ -651,6 +726,40 @@ static int sc_in_window(const scenecap_capture *c) {
     return c && c->state == 1;
 }
 
+/* Ring eviction: drops every record that belongs to a frame older than `oldest`.  Passes, draws,
+ * dispatches and their binding ranges are appended chronologically, so dropping a prefix is a memmove
+ * plus an index rebase; interned resources stay (ones no kept draw references are simply not written). */
+static void sc_evict_frames(scenecap_capture *c, uint64_t oldest) {
+    size_t p0 = 0;
+    while (p0 < c->pass_count && c->passes[p0].frame < oldest) p0++;
+    if (!p0) return;
+    size_t d0 = 0;
+    while (d0 < c->draw_count && (size_t)c->draws[d0].pass < p0) d0++;
+    size_t i0 = 0;
+    while (i0 < c->dispatch_count && (size_t)c->dispatches[i0].pass < p0) i0++;
+    size_t b0 = c->bind_count;
+    if (d0 < c->draw_count && c->draws[d0].bind_first < b0) b0 = c->draws[d0].bind_first;
+    if (i0 < c->dispatch_count && c->dispatches[i0].bind_first < b0) b0 = c->dispatches[i0].bind_first;
+    size_t bn = c->bind_count - b0;
+    if (bn) memmove(c->binds, c->binds + b0, bn * sizeof *c->binds);
+    c->bind_count = (uint32_t)bn;
+    if (d0) memmove(c->draws, c->draws + d0, (c->draw_count - d0) * sizeof *c->draws);
+    c->draw_count -= d0;
+    if (i0) memmove(c->dispatches, c->dispatches + i0, (c->dispatch_count - i0) * sizeof *c->dispatches);
+    c->dispatch_count -= i0;
+    if (p0) memmove(c->passes, c->passes + p0, (c->pass_count - p0) * sizeof *c->passes);
+    c->pass_count -= p0;
+    for (size_t d = 0; d < c->draw_count; d++) {
+        c->draws[d].pass -= (uint32_t)p0;
+        c->draws[d].bind_first -= (uint32_t)b0;
+    }
+    for (size_t i = 0; i < c->dispatch_count; i++) {
+        c->dispatches[i].pass -= (uint32_t)p0;
+        c->dispatches[i].bind_first -= (uint32_t)b0;
+    }
+    if (c->open_pass >= (int32_t)p0) c->open_pass -= (int32_t)p0; else c->open_pass = -1;
+}
+
 void scenecap_frame_begin(scenecap_capture *c, uint64_t frame) {
     if (!c) return;
     c->cur_frame = frame;
@@ -666,6 +775,9 @@ void scenecap_frame_begin(scenecap_capture *c, uint64_t frame) {
         return;
     }
     if (c->state != 1) return;
+    /* Ring capture: keep only the newest keep_frames frames (the package is the tail of the window -
+     * exactly the frames leading into whatever froze the game). */
+    if (c->keep_frames && frame + 1 > c->keep_frames) sc_evict_frames(c, frame + 1 - c->keep_frames);
     if (frame >= c->first_frame + c->frame_count) {
         char message[sizeof c->err];
         if (!scenecap_finish(c, message, sizeof message)) {
@@ -1203,8 +1315,18 @@ static int build_manifest(scenecap_capture *c, text_buf *tb) {
         }
         tb_addf(tb, ",\"instances\":%u,\"primitive_type\":\"%s\"", d->instances, prim_name((int)d->primitive));
         emit_arg_table(c, tb, d->bind_first, d->bind_count);
-        tb_puts(tb, ",");
-        emit_state(tb, &d->state, (int)d->primitive);
+        /* draws[].state is debug-only (the replayer replays from pipelines[].state); PV's ~1700 draws a
+           frame make it a third of the manifest, so it is emitted only on request. */
+        static int draw_state, draw_state_read;
+        if (!draw_state_read) {
+            const char *e = getenv("SCENECAP_DRAW_STATE");
+            draw_state = e && *e && strcmp(e, "0") != 0;
+            draw_state_read = 1;
+        }
+        if (draw_state) {
+            tb_puts(tb, ",");
+            emit_state(tb, &d->state, (int)d->primitive);
+        }
         tb_puts(tb, "}");
     }
     tb_puts(tb, "]");
@@ -1602,6 +1724,17 @@ scenecap_capture *scenecap_create(const scenecap_host *host, const scenecap_opti
     c->frame_count = options->frame_count ? options->frame_count : 1;
     c->state = 0;
     c->open_pass = -1;
+    /* The intern hash is a global whose entries index the previous capture's res array: a re-armed
+       capture must not reuse them. */
+    free(g_res_hash);
+    g_res_hash = NULL;
+    g_res_hash_cap = g_res_hash_used = 0;
+    c->keep_frames = 4;   /* PV records ~2400 draws a frame: 4 frames keep the manifest near 40 MiB */
+    const char *keep = getenv("SCENECAP_KEEP_FRAMES");
+    if (keep && keep[0]) {
+        long v = strtol(keep, NULL, 0);
+        c->keep_frames = v > 0 ? (uint32_t)v : 0;   /* 0 disables the ring and keeps every frame */
+    }
     return c;
 }
 

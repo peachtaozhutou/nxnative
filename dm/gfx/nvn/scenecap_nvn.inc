@@ -31,8 +31,7 @@
 
 typedef struct {
     uint64_t serial;
-    tex_t meta;
-    __strong id<MTLTexture> mtl;
+    tex_t meta;   /* value copy: the game may reuse the tex_t, the serial stays valid for the package */
 } sc_tex_ent;
 
 typedef struct {
@@ -54,6 +53,7 @@ static char g_sc_game[64], g_sc_title[64], g_sc_version[64], g_sc_commit[96], g_
 static char g_sc_gpu[128], g_sc_macos[128], g_sc_metal[64], g_sc_when[64];
 static __strong NSData *g_sc_source;  /* keeps the MSL bytes handed to the capture module alive */
 static __strong NSData *g_sc_refl;
+static _Atomic int g_sc_tex_gpu_dead;  /* one texture readback already timed out: the GPU is not completing */
 
 static void sc_log(const char *fmt, ...) {
     va_list ap;
@@ -269,20 +269,22 @@ static const tex_t *sc_tex_meta(uint64_t handle) {
     return &g_treg[tid].t;
 }
 
-static void sc_remember_tex(const tex_t *t, id<MTLTexture> mtl) {
-    if (!t || !mtl || !t->serial) return;
+static void sc_remember_tex(const tex_t *t) {
+    if (!t || !t->serial) return;
     for (int i = 0; i < g_sc_ntex; i++)
         if (g_sc_tex[i].serial == t->serial) {
             g_sc_tex[i].meta = *t;
-            g_sc_tex[i].mtl = mtl;
             return;
         }
     if (g_sc_ntex >= SC_TEX_MAX) return;
     g_sc_tex[g_sc_ntex].serial = t->serial;
     g_sc_tex[g_sc_ntex].meta = *t;
-    g_sc_tex[g_sc_ntex].mtl = mtl;
     g_sc_ntex++;
 }
+
+/* Resolves the Metal texture of a remembered texture.  Only called from the readback path at the frame
+ * boundary (scenecap_finish): calling tex_mtl while the frame records would materialise textures the
+ * host had not uploaded yet, which perturbs the render (observed as flicker in PV). */
 
 static sc_tex_ent *sc_find_tex(uint64_t serial) {
     for (int i = 0; i < g_sc_ntex; i++)
@@ -316,18 +318,26 @@ static NvShader *sc_find_shader(const char *key) {
 static int sc_host_texture_info(void *user, uint64_t serial, scenecap_texture_info *out) {
     (void)user;
     sc_tex_ent *e = sc_find_tex(serial);
-    if (!e || !e->mtl) return 0;
-    id<MTLTexture> m = e->mtl;
+    if (!e) return 0;
+    /* From the NVN descriptor only: no Metal object is touched while recording. */
+    const nvn_texdesc *d = &e->meta.d;
+    uint32_t pf = 0;
+    nvn_fmt_to_mtl(d->format, &pf, NULL);
     memset(out, 0, sizeof *out);
-    out->width = (uint32_t)m.width;
-    out->height = (uint32_t)m.height;
-    out->depth = (uint32_t)m.depth;
-    out->mip_levels = (uint32_t)m.mipmapLevelCount;
-    out->array_layers = (uint32_t)m.arrayLength;
-    out->sample_count = (uint32_t)m.sampleCount;
+    out->width = d->width;
+    out->height = d->height;
+    out->depth = d->depth ? d->depth : 1;
+    out->mip_levels = d->levels ? d->levels : 1;
+    out->array_layers = e->meta.L.layers ? e->meta.L.layers : 1;
+    out->sample_count = d->samples > 1 ? (uint32_t)d->samples : 1;
     out->texture_type = sc_texture_type(&e->meta);
-    snprintf(out->pixel_format, sizeof out->pixel_format, "%s", sc_pf_name((uint32_t)m.pixelFormat));
+    snprintf(out->pixel_format, sizeof out->pixel_format, "%s", sc_pf_name(pf));
     return 1;
+}
+
+/* The Metal texture for the readback blit; resolved only at the frame boundary, never while recording. */
+static id<MTLTexture> sc_tex_mtl(sc_tex_ent *e) {
+    return e ? tex_mtl(&e->meta) : nil;
 }
 
 static size_t sc_pixel_bytes(MTLPixelFormat pf) {
@@ -389,8 +399,10 @@ static long sc_host_texture_read(void *user, uint64_t serial, uint32_t level, ui
                                  size_t capacity) {
     (void)user;
     sc_tex_ent *e = sc_find_tex(serial);
-    if (!e || !e->mtl) return -1;
-    id<MTLTexture> t = e->mtl;
+    if (!e) return -1;
+    if (atomic_load(&g_sc_tex_gpu_dead)) return -1;
+    id<MTLTexture> t = sc_tex_mtl(e);
+    if (!t) return -1;
     if (t.sampleCount > 1 || t.framebufferOnly) return -1;
     NSUInteger w = MAX(t.width >> level, 1), h = MAX(t.height >> level, 1);
     NSUInteger bw = 1, bh = 1, bbs = 1;
@@ -426,8 +438,16 @@ static long sc_host_texture_read(void *user, uint64_t serial, uint32_t level, ui
  destinationBytesPerImage:aligned * (is_block ? col_blocks : h)
                   options:opt];
     [blit endEncoding];
+    /* A hung GPU never completes the blit: wait with a deadline, and once one readback has timed out skip
+       the rest so the quit-time flush still writes the package (textures missing, passes/draws intact). */
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> b) { (void)b; dispatch_semaphore_signal(done); }];
     [cb commit];
-    [cb waitUntilCompleted];
+    if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 3LL * NSEC_PER_SEC)) != 0) {
+        atomic_store(&g_sc_tex_gpu_dead, 1);
+        MLOG("scenecap: texture readback timed out (the GPU is not completing); skipping the remaining texture snapshots so the flush can finish");
+        return -1;
+    }
     const uint8_t *src = (const uint8_t *)rb.contents;
     uint8_t *out = (uint8_t *)dst;
     NSUInteger rows = is_block ? col_blocks : h;
@@ -667,6 +687,11 @@ void scenecap_nvn_frame(uint64_t frame) {
         snprintf(path, sizeof path, "%s", g_sc_request);
         pthread_mutex_unlock(&g_mu);
         atomic_store(&g_sc_requested, 0);
+        /* Re-arming discards the old window's records: the new request defines what gets written. */
+        if (g_sc_cap) {
+            scenecap_destroy(g_sc_cap);
+            g_sc_cap = NULL;
+        }
         g_sc_state = 0;
         unsigned want = atomic_load(&g_sc_want_frames);
         atomic_store(&g_sc_want_frames, 0);
@@ -685,10 +710,8 @@ void scenecap_nvn_pass_begin(void *descriptor, uint32_t width, uint32_t height) 
     uint32_t n = 0;
     for (int i = 0; i < R.rt.n && i < 8; i++) {
         const tex_t *t = R.rt.color[i];
-        if (!t) continue;
-        id<MTLTexture> mt = tex_mtl(t);
-        if (!mt || !mt.width || !mt.height) continue;
-        sc_remember_tex(t, mt);
+        if (!t || !t->serial) continue;
+        sc_remember_tex(t);
         scenecap_attachment *a = &atts[n];
         memset(a, 0, sizeof *a);
         a->slot = (uint32_t)i;
@@ -711,37 +734,38 @@ void scenecap_nvn_pass_begin(void *descriptor, uint32_t width, uint32_t height) 
         }
         n++;
     }
-    if (R.rt.depth) {
-        id<MTLTexture> dt = tex_mtl(R.rt.depth);
-        if (dt && dt.width && dt.height) {
-            sc_remember_tex(R.rt.depth, dt);
-            scenecap_attachment *a = &atts[n];
-            memset(a, 0, sizeof *a);
-            a->slot = 8;
-            a->has_texture = 1;
-            a->texture = R.rt.depth->serial;
-            a->level = R.rt.has_dview && R.rt.dview.set_levels ? R.rt.dview.base_level : 0;
-            a->layer = R.rt.has_dview && R.rt.dview.set_layers ? R.rt.dview.min_layer : 0;
-            a->load = pd.depthAttachment.loadAction == MTLLoadActionClear ? SCENECAP_LOAD_CLEAR
-                      : pd.depthAttachment.loadAction == MTLLoadActionLoad ? SCENECAP_LOAD_LOAD
-                                                                           : SCENECAP_LOAD_DONTCARE;
-            a->store = pd.depthAttachment.storeAction == MTLStoreActionStore ? SCENECAP_STORE_STORE
-                                                                             : SCENECAP_STORE_DONTCARE;
-            if (a->load == SCENECAP_LOAD_CLEAR) {
-                a->clear[0] = (float)pd.depthAttachment.clearDepth;
-                a->clear_count = 1;
-            }
-            n++;
+    if (R.rt.depth && R.rt.depth->serial) {
+        const tex_t *dt = R.rt.depth;
+        sc_remember_tex(dt);
+        scenecap_attachment *a = &atts[n];
+        memset(a, 0, sizeof *a);
+        a->slot = 8;
+        a->has_texture = 1;
+        a->texture = dt->serial;
+        a->level = R.rt.has_dview && R.rt.dview.set_levels ? R.rt.dview.base_level : 0;
+        a->layer = R.rt.has_dview && R.rt.dview.set_layers ? R.rt.dview.min_layer : 0;
+        a->load = pd.depthAttachment.loadAction == MTLLoadActionClear ? SCENECAP_LOAD_CLEAR
+                  : pd.depthAttachment.loadAction == MTLLoadActionLoad ? SCENECAP_LOAD_LOAD
+                                                                       : SCENECAP_LOAD_DONTCARE;
+        a->store = pd.depthAttachment.storeAction == MTLStoreActionStore ? SCENECAP_STORE_STORE
+                                                                         : SCENECAP_STORE_DONTCARE;
+        if (a->load == SCENECAP_LOAD_CLEAR) {
+            a->clear[0] = (float)pd.depthAttachment.clearDepth;
+            a->clear_count = 1;
         }
+        n++;
     }
     if (!n) return;
-    id<MTLTexture> first = tex_mtl(R.rt.color[0] ? R.rt.color[0] : R.rt.depth);
+    /* Pass format name from the first attachment's NVN format; no Metal object is queried while recording. */
+    const tex_t *first = R.rt.color[0] ? R.rt.color[0] : R.rt.depth;
+    uint32_t first_pf = 0;
+    if (first) nvn_fmt_to_mtl(first->d.format, &first_pf, NULL);
     scenecap_pass p;
     memset(&p, 0, sizeof p);
     p.kind = SCENECAP_PASS_RENDER;
     p.width = width;
     p.height = height;
-    p.pixel_format = sc_pf_name(first ? (uint32_t)first.pixelFormat : 0);
+    p.pixel_format = sc_pf_name(first_pf);
     p.serial = g_pass.serial;
     p.attachments = atts;
     p.attachment_count = n;
@@ -833,10 +857,8 @@ static void sc_fill_bindings(scenecap_binding *b, uint32_t *count) {
             uint64_t h = S.tex[st][r];
             if (!h) continue;
             const tex_t *t = sc_tex_meta(h);
-            if (!t) continue;
-            id<MTLTexture> mt = tex_mtl(t);
-            if (!mt) continue;
-            sc_remember_tex(t, mt);
+            if (!t || !t->serial) continue;
+            sc_remember_tex(t);
             b[n].kind = SCENECAP_BIND_TEXTURE;
             b[n].stage = st;
             b[n].index = r;
@@ -850,10 +872,8 @@ static void sc_fill_bindings(scenecap_binding *b, uint32_t *count) {
             uint64_t h = S.img[st][r];
             if (!h) continue;
             const tex_t *t = sc_tex_meta(h);
-            if (!t) continue;
-            id<MTLTexture> mt = tex_mtl(t);
-            if (!mt) continue;
-            sc_remember_tex(t, mt);
+            if (!t || !t->serial) continue;
+            sc_remember_tex(t);
             b[n].kind = SCENECAP_BIND_STORAGE_IMAGE;
             b[n].stage = st;
             b[n].index = r;
@@ -1039,8 +1059,9 @@ void dm_gfx_scenecap_record(const char *path, unsigned frames) { scenecap_nvn_re
 
 void scenecap_nvn_shutdown(void) {
     if (g_sc_cap) {
-        char err[256];
-        scenecap_finish(g_sc_cap, err, sizeof err);
+        char err[512];
+        if (!scenecap_finish(g_sc_cap, err, sizeof err))
+            MLOG("scenecap: flush on exit failed: %s", err[0] ? err : scenecap_last_error(g_sc_cap));
         scenecap_destroy(g_sc_cap);
         g_sc_cap = NULL;
     }
