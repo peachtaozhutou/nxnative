@@ -290,6 +290,18 @@ static NSString *cap_name(int c) { return c == 30 ? @"30 (稳定档)" : c == 60 
     [self position];
 }
 @end
+@interface DmCheatHelper : NSObject
++ (instancetype)shared;
+- (void)dm_cheat_pick:(NSMenuItem *)s;
+@end
+@implementation DmCheatHelper
++ (instancetype)shared { static DmCheatHelper *h; return h ?: (h = [DmCheatHelper new]); }
+- (void)dm_cheat_pick:(NSMenuItem *)s {
+    extern void dm_cheat_toggle(int); extern int dm_cheat_enabled(int);
+    dm_cheat_toggle((int)s.tag);
+    s.state = dm_cheat_enabled((int)s.tag) ? NSControlStateValueOn : NSControlStateValueOff;
+}
+@end
 void front_run(void (*guest)(void)) {
     // A game: tell macOS its work is latency-critical, so the system does not trade its frame time for power while the frame rate is capped
     static id activity; activity = [[NSProcessInfo processInfo] beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
@@ -346,6 +358,21 @@ void front_run(void (*guest)(void)) {
         }
         NSMenuItem *fpsroot = [[NSMenuItem alloc] initWithTitle:@"帧率上限" action:nil keyEquivalent:@""];
         [fpsroot setSubmenu:fpsm]; [bar addItem:fpsroot];
+        // 金手指 menu: the player's cheat-file toggles (hle_cheats.c, per the current build id)
+        { extern int dm_cheat_count(void); extern const char *dm_cheat_name(int); extern int dm_cheat_enabled(int);
+          NSMenu *cheatm = [[NSMenu alloc] initWithTitle:@"金手指"];
+          int nc = dm_cheat_count();
+          for (int i = 0; i < nc; i++) {
+              NSMenuItem *it = [[NSMenuItem alloc] initWithTitle:[NSString stringWithUTF8String:dm_cheat_name(i)] action:@selector(dm_cheat_pick:) keyEquivalent:@""];
+              it.tag = i; it.target = [DmCheatHelper shared];
+              it.state = dm_cheat_enabled(i) ? NSControlStateValueOn : NSControlStateValueOff;
+              [cheatm addItem:it];
+          }
+          if (!nc) [cheatm addItemWithTitle:@"(未找到金手指文件)" action:nil keyEquivalent:@""];
+          NSMenuItem *cheatroot = [[NSMenuItem alloc] initWithTitle:@"金手指" action:nil keyEquivalent:@""];
+          [cheatroot setSubmenu:cheatm]; [bar addItem:cheatroot];
+          if (nc) LOG("front end: 金手指 menu with %d toggles", nc);
+        }
         NSApp.mainMenu = bar;
         if (getenv("DM_FULLSCREEN")) dispatch_async(dispatch_get_main_queue(), ^{ [win toggleFullScreen:nil]; });   // start in fullscreen
         for (NSNotificationName nm in @[GCControllerDidConnectNotification, GCControllerDidDisconnectNotification])
