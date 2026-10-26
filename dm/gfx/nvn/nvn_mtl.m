@@ -6700,6 +6700,61 @@ static int skip_imgui_draw(const char *fs_key) {
     static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_SKIP_IMGUI"); v = !(e && !strcmp(e, "0")); }
     return v && fs_key && !strncmp(fs_key, "da917a747d97908e", 16);
 }
+// PV: the titanspecialimgui var0 text pipeline (vertex 5d42cbeb294d6f1c_b) faults the GPU reading
+// VA 0x40 (BIF0 page fault, is_read) on its first draws.  Its vertex stage reads three float4 inputs
+// through [[stage_in]] and nothing else - no buffers, no textures - so the null must be one of: a
+// vertex stream's guest binding, the index buffer, or (for the capture step) a transform-feedback
+// output binding.  This probe dumps all of them for every draw that uses the key (first 64 draws;
+// DM_PV_IMGUI_PROBE=0 turns it off).
+static void pv_imgui_probe(NvProg *pr, const p_draw *dw, const p_draw_idx *di, int tf) {
+    static int on = -1, n;
+    if (on < 0) { const char *e = getenv("DM_PV_IMGUI_PROBE"); on = !(e && *e && !strcmp(e, "0")); }
+    if (!on || n >= 64 || !pr || !pr->sh[0]) return;
+    NvShader *vs = pr->sh[0];
+    if (strncmp(vs->key, "5d42cbeb", 8) != 0) return;
+    int i = n++;
+    MLOG("pv-imgui[%d] %s draw first=%d count=%d inst=%d prim=%d", i, tf ? "TF-capture" : di ? "indexed" : "array",
+         dw ? dw->first : -1, dw ? dw->count : (di ? di->count : -1),
+         dw ? dw->instances : (di ? di->instances : -1), dw ? dw->prim : (di ? di->prim : -1));
+    const nvn_refl *rf = &vs->rf;
+    for (int v = 0; v < rf->nv; v++) {
+        int loc = rf->v[v].loc, a = rf->v[v].nvn;
+        int st = a >= 0 && a < 16 ? S.attr[a].stream : -1;
+        MLOG("pv-imgui[%d] attr loc=%d nvn=%d fmt=%#x off=%d stream=%d stride=%llu vfmt=%d%s", i, loc, a,
+             a >= 0 && a < 16 ? S.attr[a].fmt : 0, a >= 0 && a < 16 ? S.attr[a].offset : -1, st,
+             st >= 0 && st < 16 ? (unsigned long long)S.stream[st].stride : 0ull,
+             a >= 0 && a < 16 ? (int)vfmt(S.attr[a].fmt) : -1,
+             a >= 0 && a < 16 && !S.attr[a].fmt ? " (fmt unset!)" : "");
+    }
+    for (int s = 0; s < 16; s++) {
+        if (!S.vbuf[s].address) continue;
+        void *mb; uint64_t mo, gpu = 0;
+        int ok = mtl_gpu_addr(S.vbuf[s].address, S.vbuf[s].size ? S.vbuf[s].size : 1, &mb, &mo, &gpu);
+        MLOG("pv-imgui[%d] vbuf[%d] addr=%#llx size=%llu -> gpu=%#llx%s", i, s,
+             (unsigned long long)S.vbuf[s].address, (unsigned long long)S.vbuf[s].size,
+             (unsigned long long)gpu, ok ? "" : " UNMAPPED!");
+    }
+    if (di && di->ibuf) {
+        void *mb; uint64_t mo, gpu = 0;
+        uint64_t ibytes = (uint64_t)di->count * (di->itype == 1 ? 2u : di->itype == 0 ? 1u : 4u);
+        int ok = mtl_gpu_addr(di->ibuf, ibytes ? ibytes : 1, &mb, &mo, &gpu);
+        MLOG("pv-imgui[%d] ibuf addr=%#llx bytes=%llu itype=%d -> gpu=%#llx%s", i,
+             (unsigned long long)di->ibuf, (unsigned long long)ibytes, di->itype,
+             (unsigned long long)gpu, ok ? "" : " UNMAPPED!");
+    }
+    if (tf) {
+        for (int b = 0; b < 4; b++) {
+            if (!S.tf[b].addr) continue;
+            void *mb; uint64_t mo, gpu = 0;
+            int ok = mtl_gpu_addr(S.tf[b].addr + S.tf_off[b], 1, &mb, &mo, &gpu);
+            MLOG("pv-imgui[%d] tf[%d] addr=%#llx+%llu of size=%llu -> gpu=%#llx%s", i, b,
+                 (unsigned long long)S.tf[b].addr, (unsigned long long)S.tf_off[b],
+                 (unsigned long long)S.tf[b].size, (unsigned long long)gpu, ok ? "" : " UNMAPPED!");
+        }
+    }
+    if (n == 64) MLOG("pv-imgui: probe cap reached; further draws not dumped");
+}
+
 static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     __unsafe_unretained NvShader *vs = pr ? pr->sh[0] : nil;
     if (!S.tf_on) { PD("Z %llu draw skipped: rasterizer discard", g_stat_pass + !g_enc); return; }
@@ -6716,6 +6771,7 @@ static void tf_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di) {
     }
     __unsafe_unretained id<MTLRenderPipelineState> ps = tf_pso(vs);
     if (!ps) return;
+    pv_imgui_probe(pr, dw, di, 1);
     rp_end(); ubd_land();   // the deferred inline updates first: this draw comes before draw's conflict check (ubd_conflict) and writes its capture buffers
     // ubd_land copies them in the copy encoder and leaves it open, as does a copy or dispatch just before: a render encoder opened beside it is invalid (Metal validation: "Command buffer already
     // has an open command encoder"). Pokémon Legends: Z-A crashed in the driver when that copy encoder ended, two minutes into a new game on the Mac (GitHub issue #101)
@@ -6841,6 +6897,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
+    pv_imgui_probe(pr, dw, di, 0);   // PV: the imgui var0 text pipeline's GPU page fault (VA 0x40)
     if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
     if (zskip_can_draw(pr)) {   // Zero-source skip: the output is always 0, writing 0 over 0, so this draw changes no result (see zskip_can_draw)
