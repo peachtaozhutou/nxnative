@@ -1327,6 +1327,11 @@ uint64_t mtl_sub_commit(void) {
     rec_signal(g_ev, fence);
     rec_drain();
     g_alloc_fence[g_alloc_cur] = fence;
+    // PV: DM_SYNC_SUBMIT=1 - CPU-wait for every submission to complete before returning (kills the
+    // pipeline; a diagnostic for the in-flight-race class behind the wild-VA BIF0 read faults).
+    { static int sync_submit = -1;
+      if (sync_submit < 0) { const char *e = getenv("DM_SYNC_SUBMIT"); sync_submit = e && strcmp(e, "0") != 0; }
+      if (sync_submit) mtl_wait(fence, UINT64_MAX); }
     g_cb = nil;
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
