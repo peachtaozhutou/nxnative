@@ -122,6 +122,32 @@ static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // Dedicated lock
 static NSHashTable *g_res_objects;
 // Residency churn by call site (the power line every 300 frames, mtl_res_stats): each commit with changes is a kernel call whose cost grows with what was added or removed
 enum { RS_SITES = 16 }; static struct { int line; uint64_t n, bytes; } g_rs_site[RS_SITES]; static uint64_t g_rs_rm, g_rs_commits, g_rs_commit_ns;
+// PV GPU-fault forensics: the .ips report names the faulting VA (bif0_fault.address), so keep a ring of
+// every resource's GPU range and of removals; on a command-buffer fault the ring is dumped and the VA can
+// be attributed to the exact resource (or to a pool whose page the guest decommitted).
+enum { RES_RING = 512 };
+static struct { uint64_t gpu, size; uint64_t fence; const char *kind; int removed; } g_res_ring[RES_RING];
+static int g_res_ring_n;
+static void res_ring_note(id<MTLResource> r, const char *kind, int removed) {
+    uint64_t gpu = 0, size = 0;
+    if ([r conformsToProtocol:@protocol(MTLBuffer)]) { id<MTLBuffer> b = (id<MTLBuffer>)r; gpu = b.gpuAddress; size = b.length; }
+    else if ([r conformsToProtocol:@protocol(MTLTexture)]) { id<MTLTexture> t = (id<MTLTexture>)r; gpu = t.buffer ? t.buffer.gpuAddress : 0; size = t.allocatedSize; }
+    pthread_mutex_lock(&g_res_mu);
+    g_res_ring[g_res_ring_n % RES_RING] = (typeof(g_res_ring[0])){gpu, size, g_fence, kind, removed};
+    g_res_ring_n++;
+    pthread_mutex_unlock(&g_res_mu);
+}
+static void res_ring_dump(void) {
+    pthread_mutex_lock(&g_res_mu);
+    int n = g_res_ring_n;
+    MLOG("[fault-ring] last %d residency events (gpu / size / fence / kind / removed):", n > 96 ? 96 : n);
+    for (int k = n - (n > 96 ? 96 : n); k < n; k++) {
+        typeof(g_res_ring[0]) *e = &g_res_ring[k % RES_RING];
+        MLOG("[fault-ring] gpu=%#llx size=%#llx fence=%llu %s%s", (unsigned long long)e->gpu, (unsigned long long)e->size,
+             (unsigned long long)e->fence, e->kind, e->removed ? " REMOVED" : "");
+    }
+    pthread_mutex_unlock(&g_res_mu);
+}
 #define res_add(r) res_add_at((r), __LINE__)
 static void res_add_at(id<MTLResource> r, int line) {
     if (!r) return;
@@ -133,6 +159,7 @@ static void res_add_at(id<MTLResource> r, int line) {
     [g_res_objects addObject:r];
     g_res_dirty = 1;
     pthread_mutex_unlock(&g_res_mu);
+    res_ring_note(r, "add", 0);
 }
 static void res_remove(id<MTLResource> r) {
     if (!r) return;
@@ -142,6 +169,7 @@ static void res_remove(id<MTLResource> r) {
     [g_res_objects removeObject:r];
     g_res_dirty = 1; g_rs_rm++;
     pthread_mutex_unlock(&g_res_mu);
+    res_ring_note(r, "rm", 1);
 }
 // DM_RES_CHECK=1 (diagnostic): if textures / buffers the shader accesses through the argument block are not in the residency set, print the first 40 (textures are attributed to the actual allocation via parent texture / underlying buffer)
 static int g_res_check_on;
@@ -1244,7 +1272,15 @@ uint64_t mtl_sub_commit(void) {
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String);
+            // PV: the .ips names the faulting VA (bif0_fault.address); dump the residency ring and the pool
+            // ranges so the VA can be attributed to the exact resource (or to a decommitted pool page).
+            static int nfaultdump; if (!victim && nfaultdump++ < 2) { res_ring_dump();
+                pthread_mutex_lock(&g_mu);
+                int top[4] = {-1, -1, -1, -1};
+                for (int i = 0; i < g_npool; i++) for (int k = 0; k < 4; k++) { if (top[k] < 0 || g_pools[i].hi - g_pools[i].lo > g_pools[top[k]].hi - g_pools[top[k]].lo) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = i; break; } }
+                for (int k = 0; k < 4 && top[k] >= 0; k++) MLOG("[fault-ring] pool gpu=%#llx size=%#llx res=%d", (unsigned long long)g_pools[top[k]].gpu, (unsigned long long)(g_pools[top[k]].hi - g_pools[top[k]].lo), g_pools[top[k]].res);
+                pthread_mutex_unlock(&g_mu); } }
         for (int i = 0; i < n; i++) {
             if (ops[i].kind == 1) { if (ops[i].mode == 1) *ops[i].val += ops[i].v; else *ops[i].val = ops[i].v; }
             else if (ops[i].kind == 3) {   // Samples passed: the sum of all slots since the reset
