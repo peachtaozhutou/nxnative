@@ -128,6 +128,8 @@ enum { RS_SITES = 16 }; static struct { int line; uint64_t n, bytes; } g_rs_site
 enum { RES_RING = 512 };
 static struct { uint64_t gpu, size; uint64_t fence; const char *kind; int removed; } g_res_ring[RES_RING];
 static int g_res_ring_n;
+static void res_ring_dump(void);
+static void key_ring_dump(void);
 static void res_ring_note(id<MTLResource> r, const char *kind, int removed) {
     uint64_t gpu = 0, size = 0;
     if ([r conformsToProtocol:@protocol(MTLBuffer)]) { id<MTLBuffer> b = (id<MTLBuffer>)r; gpu = b.gpuAddress; size = b.length; }
@@ -1275,7 +1277,7 @@ uint64_t mtl_sub_commit(void) {
         if (cb.error) { atomic_store(&g_last_commit_error, 1); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String);
             // PV: the .ips names the faulting VA (bif0_fault.address); dump the residency ring and the pool
             // ranges so the VA can be attributed to the exact resource (or to a decommitted pool page).
-            static int nfaultdump; if (!victim && nfaultdump++ < 2) { res_ring_dump();
+            static int nfaultdump; if (!victim && nfaultdump++ < 2) { key_ring_dump(); res_ring_dump();
                 pthread_mutex_lock(&g_mu);
                 int top[4] = {-1, -1, -1, -1};
                 for (int i = 0; i < g_npool; i++) for (int k = 0; k < 4; k++) { if (top[k] < 0 || g_pools[i].hi - g_pools[i].lo > g_pools[top[k]].hi - g_pools[top[k]].lo) { for (int j = 3; j > k; j--) top[j] = top[j - 1]; top[k] = i; break; } }
@@ -6750,6 +6752,25 @@ static int skip_imgui_draw(const char *fs_key) {
 // vertex stream's guest binding, the index buffer, or (for the capture step) a transform-feedback
 // output binding.  This probe dumps all of them for every draw that uses the key (first 64 draws;
 // DM_PV_IMGUI_PROBE=0 turns it off).
+// PV: the faulting draw is unknown (Metal names no shader), so keep a ring of the shader pairs drawn
+// recently; a fault dumps it and the null-deref reader is among them.
+enum { KEY_RING = 256 };
+static struct { char vs[24], fs[24]; _Atomic uint64_t pass; } g_key_ring[KEY_RING];
+static _Atomic unsigned g_key_ring_n;
+static void key_ring_note(NvProg *pr, int compute) {
+    if (!pr) return;
+    unsigned i = atomic_fetch_add(&g_key_ring_n, 1) % KEY_RING;
+    NvShader *a = pr->sh[0], *b = pr->sh[1];
+    snprintf(g_key_ring[i].vs, sizeof g_key_ring[i].vs, "%s", compute ? (pr->sh[5] ? pr->sh[5]->key : "-") : a ? a->key : "-");
+    snprintf(g_key_ring[i].fs, sizeof g_key_ring[i].fs, "%s", compute ? "-" : b ? b->key : "-");
+    atomic_store(&g_key_ring[i].pass, g_stat_pass);
+}
+static void key_ring_dump(void) {
+    unsigned n = atomic_load(&g_key_ring_n);
+    MLOG("[fault-keys] last %u drawn shader pairs (pass / vertex / fragment-or-kernel):", n > 48 ? 48u : n);
+    for (unsigned k = n - (n > 48 ? 48u : n); k < n; k++)
+        MLOG("[fault-keys] pass %llu  vs %s  fs %s", (unsigned long long)atomic_load(&g_key_ring[k].pass), g_key_ring[k].vs, g_key_ring[k].fs);
+}
 static void pv_imgui_probe(NvProg *pr, const p_draw *dw, const p_draw_idx *di, int tf) {
     static int on = -1, n;
     if (on < 0) { const char *e = getenv("DM_PV_IMGUI_PROBE"); on = !(e && *e && !strcmp(e, "0")); }
@@ -6941,6 +6962,7 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (!S.prog) { RED_ONCE(18, "no program bound before the draw"); PD("Z %llu draw skipped: no program bound", g_stat_pass + !g_enc); return; }
     __unsafe_unretained NvProg *pr = g_geo_program ? g_geo_program : prog_get(S.prog);
     draw_gs_check(pr);   // a geometry stage left with no function (see prog_fold_gs)
+    key_ring_note(pr, 0);
     pv_imgui_probe(pr, dw, di, 0);   // PV: the imgui var0 text pipeline's GPU page fault (VA 0x40)
     if (S.rast_discard) { tf_draw(pr, dw, di); return; }   // the vertex stage only: transform feedback capture, or nothing (tf_draw)
     if (g_nubd && (g_enc || ubd_lazy()) && ubd_conflict(pr, dw, di)) { g_ubd_conflicts++; rp_end(); ubd_land(); }   // land the deferred inline updates before this draw (see ubd_conflict)
@@ -7264,6 +7286,7 @@ static void dispatch(const p_dispatch *dp) {
     if (dp->ind) { static int once; if (!once++) MLOG("indirect dispatch: first time (the GPU reads the threadgroup counts from %#llx)", (unsigned long long)dp->ind); }
     NvShader *cs = prog_get(S.cprog)->sh[5];
     if (!cs) { RED_ONCE(28, "the dispatched program has no compute shader (or it is not mapped)"); return; }
+    key_ring_note(prog_get(S.cprog), 1);
 #if SCENECAP_HOOKS
     scenecap_nvn_dispatch(dp);   // closes the recorded render pass itself, then records its own compute pass
 #endif
