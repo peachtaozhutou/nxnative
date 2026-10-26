@@ -474,6 +474,13 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0};   // not in the residency set yet: put in the first time it is addressed (pool_res)
     g_pool_adds++;
     [g_keep addObject:buf];
+    // PV: a pool the GPU reaches only through a texture (never through mtl_addr / mtl_gpu_addr) would
+    // never enter the residency set, and sampling it faults (BIF0 read at an in-range VA, e.g.
+    // 0x100C603xxxx).  Every pool is wired at creation now; DM_RES_ALL=0 returns to on-demand residency
+    // (the iOS wiring-cost optimization - measured irrelevant on the Mac's unified memory).
+    static int res_all = -1;
+    if (res_all < 0) { const char *e = getenv("DM_RES_ALL"); res_all = !(e && strcmp(e, "0") == 0); }
+    if (res_all) pool_res(g_npool - 1);
     pthread_mutex_unlock(&g_mu);
 }
 

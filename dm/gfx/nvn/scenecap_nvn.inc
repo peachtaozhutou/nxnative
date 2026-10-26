@@ -701,6 +701,7 @@ void scenecap_nvn_frame(uint64_t frame) {
         g_sc_state = 0;
         unsigned want = atomic_load(&g_sc_want_frames);
         atomic_store(&g_sc_want_frames, 0);
+        MLOG("scenecap: consuming request path='%s' want=%u", path, want);   // PV: the arming raced once
         if (!sc_start(path[0] ? path : NULL, want)) return;
     } else if (g_sc_state == 0 && !sc_start(NULL, 0)) {
         return;
