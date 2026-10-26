@@ -739,7 +739,7 @@ static void cmd_new_segment(cmd_t *o, uint8_t *mem, size_t n) {
 #define HOSTSEG_SZ (256u << 10)
 #define HOSTSEG_CAP (1u << 30)
 uint64_t dm_nvn_frame_count(void);
-typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed)
+typedef struct { uint8_t *mem; uint64_t frame; int busy; uintptr_t org_lo, org_hi; uint64_t rel_fence; int gpu_pending; } hostseg_t;   // org: the guest range of the recording it hangs off (0 = unknown, never reclaimed); rel_fence/gpu_pending: a released segment goes back into rotation only after the GPU finished every submission up to its release (PV: rewriting a segment the GPU still executed read garbage commands and paged-faulted at wild VAs)
 static hostseg_t *g_hostseg; static int g_nhostseg, g_caphostseg;
 static pthread_mutex_t g_hostseg_mu = PTHREAD_MUTEX_INITIALIZER;
 // Take a segment: origin = the current recording's guest bytes [BEGIN, end of JUMP); if the write pointer is already in a host segment (overflowing again), keep that segment's origin
@@ -748,10 +748,16 @@ static uint8_t *hostseg_take(const cmd_t *o) {
     uintptr_t lo = 0, hi = 0, cur = o ? (uintptr_t)o->cur : 0;
     pthread_mutex_lock(&g_hostseg_mu);
     int in_seg = 0;
+    int skipped_gpu_pending = 0;
     for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + HOSTSEG_SZ) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
     if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
-    for (int i = 0; i < g_nhostseg && !m; i++)
-        if (!g_hostseg[i].busy) { g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi }; m = g_hostseg[i].mem; }
+    for (int i = 0; i < g_nhostseg && !m; i++) {
+        if (g_hostseg[i].busy) continue;
+        if (g_hostseg[i].gpu_pending && !mtl_wait(g_hostseg[i].rel_fence, 0)) { skipped_gpu_pending++; continue; }   // GPU still executing a submission that read this segment
+        g_hostseg[i].gpu_pending = 0;
+        g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, 0, 0 }; m = g_hostseg[i].mem;
+    }
+    if (!m && skipped_gpu_pending) { static int nskip; if (++nskip <= 8) LOG("[nvn] host segment: %d released segment(s) still executing on the GPU - lending a fresh one", skipped_gpu_pending); }
     if (!m && (uint64_t)(g_nhostseg + 1) * HOSTSEG_SZ <= HOSTSEG_CAP) {
         if (g_nhostseg == g_caphostseg) { g_caphostseg = g_caphostseg ? g_caphostseg * 2 : 64; g_hostseg = realloc(g_hostseg, sizeof *g_hostseg * (size_t)g_caphostseg); }
         m = malloc(HOSTSEG_SZ);
@@ -766,7 +772,7 @@ static uint8_t *hostseg_take(const cmd_t *o) {
 // The game gives out [lo, hi): segments whose recording's guest bytes overlap it are dead, reclaim them
 static void hostseg_release(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_hostseg_mu);
-    for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) g_hostseg[i].busy = 0;
+    for (int i = 0; i < g_nhostseg; i++) if (g_hostseg[i].busy && g_hostseg[i].org_hi > lo && g_hostseg[i].org_lo < hi) { g_hostseg[i].busy = 0; g_hostseg[i].rel_fence = mtl_last_fence(); g_hostseg[i].gpu_pending = 1; }
     pthread_mutex_unlock(&g_hostseg_mu);
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
