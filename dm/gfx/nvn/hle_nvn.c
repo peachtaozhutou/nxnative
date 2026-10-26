@@ -751,8 +751,11 @@ static uint8_t *hostseg_take(const cmd_t *o) {
     int skipped_gpu_pending = 0;
     for (int i = 0; i < g_nhostseg && cur; i++) if (cur >= (uintptr_t)g_hostseg[i].mem && cur <= (uintptr_t)g_hostseg[i].mem + HOSTSEG_SZ) { lo = g_hostseg[i].org_lo; hi = g_hostseg[i].org_hi; in_seg = 1; break; }
     if (!in_seg && o && o->recording && o->cur) { lo = o->recording == 1 && o->begin && (uintptr_t)o->begin <= cur ? (uintptr_t)o->begin : cur; hi = cur + 16; }
+    static int noreuse = -1;
+    if (noreuse < 0) { const char *e = getenv("DM_SEG_NOREUSE"); noreuse = e && strcmp(e, "0") != 0; }   // PV: never re-lend a segment (the rewrite race fired 6 times in one session even fence-gated)
     for (int i = 0; i < g_nhostseg && !m; i++) {
         if (g_hostseg[i].busy) continue;
+        if (noreuse) { skipped_gpu_pending++; continue; }
         if (g_hostseg[i].gpu_pending && !mtl_wait(g_hostseg[i].rel_fence, 0)) { skipped_gpu_pending++; continue; }   // GPU still executing a submission that read this segment
         g_hostseg[i].gpu_pending = 0;
         g_hostseg[i] = (hostseg_t){ g_hostseg[i].mem, f, 1, lo, hi, 0, 0 }; m = g_hostseg[i].mem;
