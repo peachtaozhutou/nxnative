@@ -697,6 +697,21 @@ void mtl_sub_begin(void) {
     atomic_store(&g_last_commit_error, 0);
     g_sub_pool = objc_autoreleasePoolPush();
     g_cb = rec_cb_new();
+    // PV: DM_NVN_GPUTRACE=<start_submission>:<count> GPU-captures that many submissions into
+    // /tmp/pv-gputrace-N.gputrace - the one tool that names the exact command behind the wild-VA
+    // BIF0 read faults (dm commit 69342f4's plan).  Submissions ≈ frames (one submit per present).
+    { static int at = INT_MIN, left, n; static MTLCaptureManager *mgr;
+      if (at == INT_MIN) { const char *e = getenv("DM_NVN_GPUTRACE"); if (e && *e) { at = atoi(e); const char *c = strchr(e, ':'); left = c ? atoi(c + 1) : 3; } else at = -2; }
+      if (at >= 0 && (int)g_sub_serial >= at && left > 0 && !mgr) {
+          mgr = [MTLCaptureManager sharedCaptureManager];
+          MTLCaptureDescriptor *d = [MTLCaptureDescriptor new];
+          d.captureObject = g_q; d.destination = MTLCaptureDestinationGPUTraceDocument;
+          d.outputURL = [NSURL fileURLWithPath:[NSString stringWithFormat:@"/tmp/pv-gputrace-%d.gputrace", n]];
+          NSError *ce = nil; if (![mgr startCaptureWithDescriptor:d error:&ce]) { MLOG("[RED] GPU capture start failed (submission %u): %s", (unsigned)g_sub_serial, ce.localizedDescription.UTF8String); mgr = nil; at = -2; }
+          else { n++; MLOG("GPU capture started at submission %u (%d left, /tmp/pv-gputrace-%d.gputrace)", (unsigned)g_sub_serial, left, n - 1); }
+      }
+      if (mgr && left > 0 && --left == 0) { [mgr stopCapture]; MLOG("GPU capture stopped after submission %u", (unsigned)g_sub_serial); mgr = nil; }
+    }
     // Do not wait for the GPU mid-frame (hot real device: with a fixed rotation of 3, when the GPU cannot keep up every frame blocks here, and the submit thread runs at low frequency after waking, instruction count −18% but CPU time +49%):
     // pick an allocator the GPU has finished with; if all are in use create a new one; only at the cap wait for the oldest one. How far ahead it runs is bounded by the wait where the game acquires the swapchain texture, same as the old interface.
     int alloc_i = -1; uint64_t done = g_done;
