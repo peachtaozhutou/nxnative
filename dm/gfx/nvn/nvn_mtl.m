@@ -375,6 +375,7 @@ void mtl_init(void) {
     }
     MTL4ArgumentTableDescriptor *atd = [MTL4ArgumentTableDescriptor new];
     atd.maxBufferBindCount = 31; atd.maxTextureBindCount = 1;
+    atd.initializeBindings = YES;   // never-set entries read as nil (zero) instead of undefined bindings: PV's BIF0 read faults at wild VAs smelled exactly like undefined-entry dereferences, so make every unset entry benign
     NSError *ate = nil;
     g_vt = rec_table([g_dev newArgumentTableWithDescriptor:atd error:&ate]); if (!g_vt) MDIE("failed to create the vertex argument table: %s", ate.localizedDescription.UTF8String);
     g_vt_valid = 0;
