@@ -1,0 +1,8 @@
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1000: frame 999; since the last submission: passes +115, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1001: frame 1000; since the last submission: passes +115, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1002: frame 1001; since the last submission: passes +114, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1002: frame 1001; since the last submission: passes +115, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1003: frame 1002; since the last submission: passes +114, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1003: frame 1002; since the last submission: passes +115, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1004: frame 1003; since the last submission: passes +114, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
+[dm] [nvn-mtl] [RED] state of the failed submission fence=1004: frame 1003; since the last submission: passes +115, first texture uploads +0, re-uploads +0, serial table changes +0; deferred-release queue 8
