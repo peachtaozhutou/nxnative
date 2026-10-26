@@ -6753,23 +6753,34 @@ static int skip_imgui_draw(const char *fs_key) {
 // output binding.  This probe dumps all of them for every draw that uses the key (first 64 draws;
 // DM_PV_IMGUI_PROBE=0 turns it off).
 // PV: the faulting draw is unknown (Metal names no shader), so keep a ring of the shader pairs drawn
-// recently; a fault dumps it and the null-deref reader is among them.
+// recently; a fault dumps it and the null-deref reader is among them.  Plain mutex, no atomics in the
+// reader: the first atomic-read dump took a SIGBUS mid-print.
 enum { KEY_RING = 256 };
-static struct { char vs[24], fs[24]; _Atomic uint64_t pass; } g_key_ring[KEY_RING];
-static _Atomic unsigned g_key_ring_n;
+static struct { char vs[24], fs[24]; uint64_t pass; } g_key_ring[KEY_RING];
+static unsigned g_key_ring_n;
+static pthread_mutex_t g_key_ring_mu = PTHREAD_MUTEX_INITIALIZER;
 static void key_ring_note(NvProg *pr, int compute) {
     if (!pr) return;
-    unsigned i = atomic_fetch_add(&g_key_ring_n, 1) % KEY_RING;
     NvShader *a = pr->sh[0], *b = pr->sh[1];
+    pthread_mutex_lock(&g_key_ring_mu);
+    unsigned i = g_key_ring_n++ % KEY_RING;
     snprintf(g_key_ring[i].vs, sizeof g_key_ring[i].vs, "%s", compute ? (pr->sh[5] ? pr->sh[5]->key : "-") : a ? a->key : "-");
     snprintf(g_key_ring[i].fs, sizeof g_key_ring[i].fs, "%s", compute ? "-" : b ? b->key : "-");
-    atomic_store(&g_key_ring[i].pass, g_stat_pass);
+    g_key_ring[i].pass = g_stat_pass;
+    pthread_mutex_unlock(&g_key_ring_mu);
 }
 static void key_ring_dump(void) {
-    unsigned n = atomic_load(&g_key_ring_n);
-    MLOG("[fault-keys] last %u drawn shader pairs (pass / vertex / fragment-or-kernel):", n > 48 ? 48u : n);
-    for (unsigned k = n - (n > 48 ? 48u : n); k < n; k++)
-        MLOG("[fault-keys] pass %llu  vs %s  fs %s", (unsigned long long)atomic_load(&g_key_ring[k].pass), g_key_ring[k].vs, g_key_ring[k].fs);
+    typeof(g_key_ring[0]) local[48];
+    unsigned n, first;
+    pthread_mutex_lock(&g_key_ring_mu);
+    n = g_key_ring_n;
+    first = n > 48 ? n - 48 : 0;
+    for (unsigned k = first; k < n; k++) local[k - first] = g_key_ring[k % KEY_RING];
+    pthread_mutex_unlock(&g_key_ring_mu);
+    unsigned count = n - first;
+    MLOG("[fault-keys] last %u drawn shader pairs (pass / vertex / fragment-or-kernel):", count);
+    for (unsigned k = 0; k < count; k++)
+        MLOG("[fault-keys] pass %llu  vs %s  fs %s", (unsigned long long)local[k].pass, local[k].vs, local[k].fs);
 }
 static void pv_imgui_probe(NvProg *pr, const p_draw *dw, const p_draw_idx *di, int tf) {
     static int on = -1, n;

@@ -5,6 +5,10 @@
 #include <signal.h>
 #include <dlfcn.h>
 #include <sys/ucontext.h>
+
+// PV: the scene-capture glue defines this in SCENECAP=1 builds (dm/gfx/nvn/scenecap_nvn.inc);
+// weak here so release builds link fine.  A crash must still flush the armed capture.
+void scenecap_nvn_shutdown(void) __attribute__((weak));
 #include <unistd.h>
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
@@ -137,6 +141,13 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
         for (int i = 0; i < g_nfault_hook; i++) if (g_fault_hook[i](si->si_addr, is_write, uc)) return;
     }
     crash_gate(sig);
+    // PV: a crash aborts the process before the capture destructor runs and the recorded frames would be
+    // lost.  Fork: the child inherits the recorded state and flushes the package (alarm-bounded; unsafe
+    // calls are fine there), the parent goes on with its own teardown and never waits.
+    if (scenecap_nvn_shutdown) {
+        pid_t kid = fork();
+        if (kid == 0) { alarm(60); scenecap_nvn_shutdown(); _exit(0); }
+    }
     // The stderr lock may be held by another thread (stuck or suspended): the fprintf below would hang with it, the time limit's SIGALRM could not end the run, and the log would get nothing.
     // If it still cannot be taken after 1 s, write a single line with write() (pc / lr as module offsets) and exit. When this thread itself holds the lock, ftrylockfile still succeeds (file locks are recursive), unaffected
     for (int i = 0; ftrylockfile(stderr); i++) {
