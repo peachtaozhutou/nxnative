@@ -3727,20 +3727,28 @@ static void ubd_dirty(uint64_t lo, uint64_t hi) {
 // Take the pool generation before resolving, so a concurrent pool change forces a fresh lookup next time.
 static void bind_vbufs(id<MTL4RenderCommandEncoder> en) {
     static struct { uint64_t addr, gpu, gen; } cache[16];
+    static id<MTLBuffer> zero; static uint64_t zero_gpu;
+    if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); zero_gpu = zero.gpuAddress; }
     uint64_t gen = atomic_load_explicit(&g_pool_gen, memory_order_acquire);
+    int bound[32] = {0};
     for (int s = 0; s < 16; s++) {
         uint64_t addr = S.vbuf[s].address, gpu;
         if (!addr) continue;
         if (g_vbuf_cache && cache[s].addr == addr && cache[s].gen == gen) { gpu = cache[s].gpu; g_vbuf_reuse++; }
         else {
             void *mb; uint64_t mo; g_vbuf_resolve++;
-            if (!mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) continue;
+            if (!mtl_gpu_addr(addr, 1, &mb, &mo, &gpu)) {
+                // PV: a stream whose address resolves to no pool used to be skipped - the Metal slot then
+                // kept whatever the previous draw left there, or nothing at all, and the vertex fetch
+                // followed that stale or null pointer (GPU page fault, BIF0 read at VA 0x2080).
+                static int nskip; if (nskip++ < 8) MLOG("[RED] vertex stream %d: address %#llx (+%llu) is in no memory pool: the slot gets the zero buffer", s, (unsigned long long)addr, (unsigned long long)S.vbuf[s].size);
+                continue;
+            }
             cache[s].addr = addr; cache[s].gpu = gpu; cache[s].gen = gen;
         }
-        enc_r_vbuf(en, VB_SLOT(s), gpu);
+        enc_r_vbuf(en, VB_SLOT(s), gpu); bound[VB_SLOT(s)] = 1;
     }
-    static id<MTLBuffer> zero; static uint64_t zero_gpu;
-    if (!zero) { zero = [g_dev newBufferWithLength:64 options:MTLResourceStorageModeShared]; res_add(zero); zero_gpu = zero.gpuAddress; }
+    for (int s = 0; s < 16; s++) { int slot = VB_SLOT(s); if (!bound[slot]) enc_r_vbuf(en, slot, zero_gpu); }   // every stream slot is bound every draw: no stale or null slot survives
     enc_r_vbuf(en, 30, zero_gpu);
 }
 // Size of an attachment-less pass (rp_begin_ex_): the far corner of viewport 0, else of the scissor, clamped to Metal's 1..16384
