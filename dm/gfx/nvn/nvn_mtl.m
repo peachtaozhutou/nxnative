@@ -4919,6 +4919,14 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     pthread_mutex_unlock(&g_rmu);
     id<MTLBuffer> ab; size_t off = arena_alloc(arg_len, &ab);
     memcpy((uint8_t *)ab.contents + off, slots, arg_len);
+    // PV: the imgui var0 text pipeline (vertex c77b47182ae6261f / fragment da917a747d97908e) page-faults
+    // the GPU reading its descriptor at NULL+0x40.  Scan the encoded block for zero 8-byte entries and
+    // dump them once - if a NULL binding is being encoded, this names the exact slot.
+    { static int nz;
+      if (nz < 6 && strncmp(sh->key, "c77b471", 7) == 0) { nz++;
+          char b[600]; size_t o = snprintf(b, sizeof b, "pv-desc[%s stage=%d len=%zu gpu=%#llx] zeros:", sh->key, nvn_stage, arg_len, (unsigned long long)(g_cur_arena->gpu + off));
+          for (size_t q = 0; q + 8 <= arg_len && o < sizeof b - 24; q += 8) if (*(uint64_t *)((uint8_t *)slots + q) == 0) o += snprintf(b + o, sizeof b - o, " %#zx", q);
+          MLOG("%s", b); } }
     bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_binst = g_draw_binst; g_args_dirty[nvn_stage] = 0;
     g_stat_args_enc++;
