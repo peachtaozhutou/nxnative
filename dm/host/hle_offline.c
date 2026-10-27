@@ -200,3 +200,14 @@ HLE_FORCE("_ZN2nn5album21GetSharePostedLastUrlEPcmRKNS0_7ShareIdE", "URL of the 
 HLE_FORCE("_ZN2nn5album14ShowAlbumFilesEv", "album applet: not shown", Result, h_album_Show, void) { return RES_FAIL; }
 // Pokémon Legends: Z-A (SDK 19): a screenshot of the current frame, taken by the capture service
 HLE_FORCE("_ZN2nn5album21SaveCurrentScreenshotENS0_17AlbumReportOptionE", "screenshot of the current frame (capsrv): no album, fails", Result, h_album_SaveCur, int report) { (void)report; LOG("album::SaveCurrentScreenshot (no album)"); return RES_FAIL; }
+
+// ---------- bluetooth: no adapter. Pokémon Violet initializes the stack at boot (its Pokémon GO Plus+ link) and aborts in the SDK's
+// btm user interface when the bt / btm:u services cannot hand out the IBtmUserCore object; the game never waits on the events without one ----------
+HLE_FORCE("_ZN2nn9bluetooth3hal4user32InitializeBluetoothUserInterfaceEv", "bluetooth HAL: no adapter on the host, no-op", Result, h_bt_hal_init, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3btm4user26InitializeBtmUserInterfaceEv", "bluetooth manager user: no adapter on the host, no-op", Result, h_btm_init, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth19AcquireBleScanEventEPNS_2os15SystemEventTypeE", "bluetooth scan event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_scan, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth37AcquireBleConnectionStateChangedEventEPNS_2os15SystemEventTypeE", "bluetooth connection event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_conn, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth31AcquireBleServiceDiscoveryEventEPNS_2os15SystemEventTypeE", "bluetooth discovery event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_disc, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth22AcquireBlePairingEventEPNS_2os15SystemEventTypeE", "bluetooth pairing event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_pair, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth24AcquireBleMtuConfigEventEPNS_2os15SystemEventTypeE", "bluetooth MTU event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_mtu, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
+HLE_FORCE("_ZN2nn9bluetooth28AcquireBleGattOperationEventEPNS_2os15SystemEventTypeE", "bluetooth GATT event: no adapter; bound to a kernel event, never signalled", Result, h_bt_ev_gatt, void *ev) { hle_bind_system_event(ev, 0); return RES_OK; }
